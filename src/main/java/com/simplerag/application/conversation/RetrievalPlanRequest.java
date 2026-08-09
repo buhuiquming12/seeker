@@ -13,7 +13,8 @@ public record RetrievalPlanRequest(
         List<ChatMessage> history,
         List<RagCitation> citations,
         List<RetrievalAttempt> attempts,
-        int remainingSearches
+        int remainingSearches,
+        boolean semanticRetrievalAvailable
 ) {
     public RetrievalPlanRequest {
         Objects.requireNonNull(knowledgeBaseId, "knowledgeBaseId");
@@ -29,5 +30,16 @@ public record RetrievalPlanRequest(
         history = List.copyOf(history);
         citations = List.copyOf(citations);
         attempts = List.copyOf(attempts);
+    }
+
+    /**
+     * Assumes vector retrieval is available. Kept so callers that never ask for a HyDE pseudo-document
+     * — and every existing test — do not have to state a capability they do not use.
+     */
+    public RetrievalPlanRequest(String knowledgeBaseId, long sourceRevision, String question,
+                                List<ChatMessage> history, List<RagCitation> citations,
+                                List<RetrievalAttempt> attempts, int remainingSearches) {
+        this(knowledgeBaseId, sourceRevision, question, history, citations, attempts,
+                remainingSearches, true);
     }
 }

@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.simplerag.model.DocumentChunk;
 import com.simplerag.model.SearchResult;
+import com.simplerag.search.QueryDecomposer;
+import com.simplerag.search.QueryFusion;
 import com.simplerag.search.RetrievalStrategy;
 import com.simplerag.search.SemanticSearchEngine;
 
@@ -18,8 +20,12 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 public final class RetrievalEvaluator {
+    /** Ablation row name for "RRF_RERANK, but with the query decomposed and the rankings fused". */
+    public static final String QUERY_OPTIMIZATION = "QUERY_OPTIMIZATION";
+
     private static final ObjectMapper JSON = new ObjectMapper().findAndRegisterModules()
             .enable(SerializationFeature.INDENT_OUTPUT);
 
@@ -33,6 +39,33 @@ public final class RetrievalEvaluator {
                                                SemanticSearchEngine engine,
                                                double indexingMillis,
                                                RetrievalStrategy strategy) {
+        return measure(dataset, engine, indexingMillis, strategy.name(),
+                query -> engine.search(query, 20, "全部", strategy));
+    }
+
+    /**
+     * Scores the same dataset with query decomposition and cross-query fusion in front of retrieval.
+     *
+     * <p>Deliberately retrieves through {@code engine.search} rather than {@code searchContext}, even
+     * though the ask path uses the latter: {@code searchContext} also runs MMR and stitches adjacent
+     * chunks into synthetic passages, which changes {@code content()} and would make the nDCG passage
+     * match measure something different from the other rows. This row differs from
+     * {@code RRF_RERANK} in exactly one respect — the query is decomposed and the rankings fused.
+     */
+    public RetrievalEvaluationReport evaluateWithQueryOptimization(RetrievalEvaluationDataset dataset,
+                                                                   SemanticSearchEngine engine,
+                                                                   double indexingMillis) {
+        QueryDecomposer decomposer = new QueryDecomposer();
+        return measure(dataset, engine, indexingMillis, QUERY_OPTIMIZATION,
+                query -> QueryFusion.fuse(decomposer.decompose(query),
+                        facet -> engine.search(facet, 20, "全部", RetrievalStrategy.RRF_RERANK), 20));
+    }
+
+    private RetrievalEvaluationReport measure(RetrievalEvaluationDataset dataset,
+                                               SemanticSearchEngine engine,
+                                               double indexingMillis,
+                                               String label,
+                                               Function<String, List<SearchResult>> retrieve) {
         List<RetrievalEvaluationReport.CaseResult> results = new ArrayList<>();
         List<Long> latencies = new ArrayList<>();
         Map<String, MutableMetrics> categories = new LinkedHashMap<>();
@@ -40,11 +73,11 @@ public final class RetrievalEvaluator {
         double uniqueness = 0, coldNanos = 0, cachedNanos = 0;
         for (RetrievalEvaluationCase item : dataset.cases()) {
             long started = System.nanoTime();
-            List<SearchResult> ranked = engine.search(item.query(), 20, "全部", strategy);
+            List<SearchResult> ranked = retrieve.apply(item.query());
             long cold = System.nanoTime() - started;
             coldNanos += cold;
             started = System.nanoTime();
-            engine.search(item.query(), 20, "全部", strategy);
+            retrieve.apply(item.query());
             long cached = System.nanoTime() - started;
             cachedNanos += cached;
             latencies.add(cached);
@@ -81,7 +114,7 @@ public final class RetrievalEvaluator {
         Map<String, RetrievalEvaluationReport.AggregateMetrics> categoryReport = new LinkedHashMap<>();
         categories.forEach((name, value) -> categoryReport.put(name, value.toReport()));
         return new RetrievalEvaluationReport(dataset.name(), dataset.version(),
-                engine.rankingPolicyVersion(), strategy.name(), Instant.now().toString(), count,
+                engine.rankingPolicyVersion(), label, Instant.now().toString(), count,
                 recall5 / count, recall20 / count, hit5 / count, precision5 / count,
                 mrr / count, ndcg / count, uniqueness / count,
                 nanosToMillis(coldNanos / count), nanosToMillis(cachedNanos / count),
@@ -97,6 +130,9 @@ public final class RetrievalEvaluator {
             if (strategy == RetrievalStrategy.DENSE && !engine.semanticEnabled()) continue;
             reports.put(strategy.name(), evaluate(dataset, engine, indexingMillis, strategy));
         }
+        // Same corpus, same model, same strategy as RRF_RERANK — only the query handling differs, so
+        // the delta between these two rows is the query optimisation's contribution and nothing else.
+        reports.put(QUERY_OPTIMIZATION, evaluateWithQueryOptimization(dataset, engine, indexingMillis));
         return new RetrievalAblationReport(dataset.name(), dataset.version(), Instant.now().toString(), reports);
     }
 

@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -27,6 +28,9 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public final class SemanticSearchEngine {
+    /** One turn issues at most a decomposed first round plus three planning rounds of queries. */
+    private static final int QUERY_EMBEDDING_CACHE_SIZE = 16;
+
     private final TextEmbedder embeddingProvider;
     private final DocumentScanner documentScanner;
     private final DocumentReaderRegistry readerRegistry;
@@ -47,8 +51,17 @@ public final class SemanticSearchEngine {
     private volatile boolean semanticCompatible;
     private volatile IndexManifest manifest;
     private volatile List<DocumentIndexEntry> documentEntries = List.of();
-    private String cachedQueryText = "";
-    private float[] cachedQueryEmbedding;
+    /**
+     * Query embeddings, keyed on the analyzer's semantic text. A single slot was enough while every
+     * turn issued one query; a decomposed question issues several, and the planner adds more, so a
+     * one-slot cache never hit and re-embedded work it had just done.
+     */
+    private final Map<String, float[]> queryEmbeddingCache = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, float[]> eldest) {
+            return size() > QUERY_EMBEDDING_CACHE_SIZE;
+        }
+    };
 
     public SemanticSearchEngine(TextEmbedder embeddingProvider) {
         this(embeddingProvider, new DocumentScanner(), new DocumentReaderRegistry(), new ChunkerRegistry(),
@@ -148,9 +161,25 @@ public final class SemanticSearchEngine {
 
     /** Search plus MMR, per-document quotas and parent/adjacent context expansion for generation. */
     public List<SearchResult> searchContext(String query, int limit, String extensionFilter) {
+        return searchContext(List.of(query), limit, extensionFilter, RetrievalStrategy.RRF_RERANK);
+    }
+
+    /**
+     * Context retrieval for a decomposed question: every sub-query is retrieved separately and the
+     * rankings are fused before MMR and context expansion run once over the combined pool.
+     *
+     * <p>Fusing before selection rather than after is what makes the facets comparable — MMR then sees
+     * the whole pool, so its redundancy penalty can tell a chunk two facets both want from a chunk
+     * only one facet found. A single query is an identity pass through the fusion, so the ordinary
+     * one-facet path is unchanged.
+     */
+    public List<SearchResult> searchContext(List<String> queries, int limit, String extensionFilter,
+                                            RetrievalStrategy strategy) {
+        if (queries == null || queries.isEmpty() || limit <= 0) return List.of();
+        RetrievalStrategy selected = strategy == null ? RetrievalStrategy.RRF_RERANK : strategy;
         int candidateLimit = Math.max(20, limit * 4);
-        List<SearchResult> ranked = search(query, candidateLimit, extensionFilter,
-                RetrievalStrategy.RRF_RERANK);
+        List<SearchResult> ranked = QueryFusion.fuse(queries,
+                query -> search(query, candidateLimit, extensionFilter, selected), candidateLimit);
         return contextSelector.select(ranked,
                 state.documents.stream().map(RetrievalDocument::chunk).toList(), limit);
     }
@@ -271,17 +300,20 @@ public final class SemanticSearchEngine {
         }
     }
 
+    /**
+     * Also drops cached query embeddings. They are keyed on query text alone, so a rebuild that
+     * swapped the embedding model would otherwise keep serving vectors from the previous one.
+     */
     private synchronized void clearHighlightCache() {
         highlightService.clear();
+        queryEmbeddingCache.clear();
     }
 
     private synchronized float[] semanticQuery(String query) throws IOException {
-        if (query.equals(cachedQueryText) && cachedQueryEmbedding != null) {
-            return cachedQueryEmbedding;
-        }
+        float[] cached = queryEmbeddingCache.get(query);
+        if (cached != null) return cached;
         float[] embedding = embeddingProvider.embed(List.of(query)).get(0);
-        cachedQueryEmbedding = embedding;
-        cachedQueryText = query;
+        queryEmbeddingCache.put(query, embedding);
         return embedding;
     }
 

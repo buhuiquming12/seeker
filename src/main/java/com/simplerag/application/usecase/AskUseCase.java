@@ -19,8 +19,11 @@ import com.simplerag.model.IndexStatus;
 import com.simplerag.model.KnowledgeBase;
 import com.simplerag.model.RagAnswer;
 import com.simplerag.model.RagCitation;
+import com.simplerag.model.SearchResult;
 import com.simplerag.model.TokenUsage;
 import com.simplerag.search.IndexHandle;
+import com.simplerag.search.QueryDecomposer;
+import com.simplerag.search.RetrievalStrategy;
 import com.simplerag.rag.ApiConfig;
 
 import java.io.IOException;
@@ -36,6 +39,7 @@ public final class AskUseCase implements AskKnowledge {
     private final ChatModel chat;
     private final SettingsRepository settings;
     private final DiagnosticSink diagnostics;
+    private final QueryDecomposer decomposer = new QueryDecomposer();
 
     public AskUseCase(ActiveKnowledgeRuntime runtime, KnowledgeBaseRepository knowledgeBases,
                       FreshnessGate freshnessGate, ChatModel chat) {
@@ -81,10 +85,11 @@ public final class AskUseCase implements AskKnowledge {
         AtomicBoolean authorized = new AtomicBoolean();
         IterativeRetrieval.Result retrieved = retrieval.collect(handle.knowledgeBaseId(), handle.sourceRevision(),
                 question, safeHistory, config,
-                query -> handle.engine().searchContext(query, 8, "\u5168\u90e8"),
+                (query, strategy) -> retrieveContext(handle, query, strategy),
                 scope -> publishScope(knowledgeBase, expectedRevision, config, scope,
                         onCitations, authorizer, authorized),
-                () -> freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision()));
+                () -> freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision()),
+                handle.engine().semanticEnabled());
         List<RagCitation> citations = retrieved.citations();
 
         freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision());
@@ -105,6 +110,25 @@ public final class AskUseCase implements AskKnowledge {
                         "completionTokens", Integer.toString(turnUsage.completionTokens()),
                         "totalTokens", Integer.toString(turnUsage.totalTokens())));
         return new AskResultView(answer.text(), views, answer.model(), turnUsage);
+    }
+
+    /**
+     * Retrieves the evidence for one generated query. Splits a multi-facet question into its facets
+     * first, so the dense branch is not asked to embed two unrelated topics as one point.
+     */
+    private List<SearchResult> retrieveContext(IndexHandle handle, String query, RetrievalStrategy requested) {
+        RetrievalStrategy effective = requested;
+        // A HyDE pseudo-document retrieved with DENSE against an index that has no vectors returns an
+        // empty list and nothing else — no error, no log. Degrade to the hybrid pipeline instead, so
+        // the pseudo-document's terminology still reaches BM25, and say so in the diagnostics.
+        if (requested == RetrievalStrategy.DENSE && !handle.engine().semanticEnabled()) {
+            effective = RetrievalStrategy.RRF_RERANK;
+            diagnostics.record("HyDE downgraded", "retrieval", "semantic retrieval unavailable",
+                    Map.of("knowledgeBaseId", handle.knowledgeBaseId(),
+                            "revision", Long.toString(handle.sourceRevision())));
+        }
+        List<String> facets = decomposer.decompose(query);
+        return handle.engine().searchContext(facets, 8, "全部", effective);
     }
 
     /**

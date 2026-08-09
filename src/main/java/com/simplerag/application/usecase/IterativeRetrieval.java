@@ -11,6 +11,7 @@ import com.simplerag.model.RagCitation;
 import com.simplerag.model.SearchResult;
 import com.simplerag.model.TokenUsage;
 import com.simplerag.rag.ApiConfig;
+import com.simplerag.search.RetrievalStrategy;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -19,7 +20,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Consumer;
-import java.util.function.Function;
 
 /** Runs a bounded, adaptive retrieve-evaluate-retrieve loop before answer generation. */
 final class IterativeRetrieval {
@@ -35,6 +35,16 @@ final class IterativeRetrieval {
     }
 
     /**
+     * The local retrieval seam. Takes a strategy as well as a query because a HyDE pseudo-document
+     * has to reach the vector branch alone, while an ordinary generated query goes through the full
+     * hybrid pipeline.
+     */
+    @FunctionalInterface
+    interface RetrievalFunction {
+        List<SearchResult> search(String query, RetrievalStrategy strategy);
+    }
+
+    /**
      * Citations gathered for the turn, what the planning rounds cost, and whether planning actually
      * ran. {@code plannerUnavailable} lets the caller tell "the model was satisfied" apart from
      * "we never got a decision", which matters when the evidence set is thin or empty.
@@ -47,9 +57,20 @@ final class IterativeRetrieval {
 
     Result collect(String knowledgeBaseId, long sourceRevision, String question,
                    List<ChatMessage> history, ApiConfig config,
-                   Function<String, List<SearchResult>> search,
+                   RetrievalFunction search,
                    Consumer<List<RagCitation>> onCitationScopeChanged,
                    Runnable beforeRemoteCall)
+            throws IOException, InterruptedException {
+        return collect(knowledgeBaseId, sourceRevision, question, history, config, search,
+                onCitationScopeChanged, beforeRemoteCall, true);
+    }
+
+    Result collect(String knowledgeBaseId, long sourceRevision, String question,
+                   List<ChatMessage> history, ApiConfig config,
+                   RetrievalFunction search,
+                   Consumer<List<RagCitation>> onCitationScopeChanged,
+                   Runnable beforeRemoteCall,
+                   boolean semanticRetrievalAvailable)
             throws IOException, InterruptedException {
         Map<String, Candidate> collected = new LinkedHashMap<>();
         List<RetrievalAttempt> attempts = new ArrayList<>();
@@ -58,7 +79,8 @@ final class IterativeRetrieval {
         // A pronoun-only follow-up ("它在哪？") carries nothing to retrieve on, and the planner cannot
         // help yet: it only runs after the user authorises the send. Resolve references locally first.
         String initialQuery = ConversationQueryResolver.resolve(question, history);
-        int initialAdded = addResults(collected, search.apply(initialQuery), INITIAL_CITATIONS);
+        int initialAdded = addResults(collected,
+                search.search(initialQuery, RetrievalStrategy.RRF_RERANK), INITIAL_CITATIONS);
         attempts.add(new RetrievalAttempt(initialQuery, initialAdded));
         List<RagCitation> citations = numbered(collected);
         onCitationScopeChanged.accept(citations);
@@ -68,7 +90,8 @@ final class IterativeRetrieval {
             if (collected.size() >= MAX_CITATIONS) break;
             beforeRemoteCall.run();
             RetrievalPlanRequest request = new RetrievalPlanRequest(knowledgeBaseId, sourceRevision,
-                    question, history, citations, attempts, MAX_SEARCHES - searchNumber);
+                    question, history, citations, attempts, MAX_SEARCHES - searchNumber,
+                    semanticRetrievalAvailable);
             RetrievalDecision decision;
             try {
                 decision = chat.planRetrieval(config, request);
@@ -95,13 +118,19 @@ final class IterativeRetrieval {
             // two independent facets no longer needs two round trips to cover both.
             int addedThisRound = 0;
             boolean searchedThisRound = false;
-            for (String query : decision.queries()) {
+            for (RetrievalDecision.TypedQuery planned : decision.queries()) {
                 if (Thread.currentThread().isInterrupted()) {
                     throw new InterruptedException("Question answering was cancelled");
                 }
+                String query = planned.text();
                 if (alreadyTried(attempts, query)) continue;
                 searchedThisRound = true;
-                int added = addResults(collected, search.apply(query), FOLLOW_UP_CITATIONS);
+                // A HyDE pseudo-document is prose the planner invented. Its value is entirely in the
+                // embedding, so it goes to the vector branch alone; fed to BM25 it would just match
+                // its own filler words.
+                RetrievalStrategy strategy = planned.hypothetical()
+                        ? RetrievalStrategy.DENSE : RetrievalStrategy.RRF_RERANK;
+                int added = addResults(collected, search.search(query, strategy), FOLLOW_UP_CITATIONS);
                 attempts.add(new RetrievalAttempt(query, added));
                 addedThisRound += added;
                 if (collected.size() >= MAX_CITATIONS) break;

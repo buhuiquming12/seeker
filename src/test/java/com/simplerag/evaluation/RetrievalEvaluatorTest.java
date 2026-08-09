@@ -36,8 +36,14 @@ class RetrievalEvaluatorTest {
         assertTrue(report.estimatedMemoryBytesPerThousandChunks() > 0);
         assertDoesNotThrow(() -> evaluator.verifyThresholds(dataset, report));
         RetrievalAblationReport ablations = evaluator.evaluateAblations(dataset, engine, 12.5);
-        assertEquals(java.util.Set.of("BM25", "RRF", "RRF_RERANK"),
+        // DENSE is absent because the embedder is disabled; QUERY_OPTIMIZATION always reports.
+        assertEquals(java.util.Set.of("BM25", "RRF", "RRF_RERANK", "QUERY_OPTIMIZATION"),
                 ablations.strategies().keySet());
+        // A single-facet query is not decomposed, so this row must match RRF_RERANK exactly.
+        RetrievalEvaluationReport optimized = ablations.strategies().get("QUERY_OPTIMIZATION");
+        assertEquals(ablations.strategies().get("RRF_RERANK").recallAt5(), optimized.recallAt5());
+        assertEquals(ablations.strategies().get("RRF_RERANK").ndcgAt10(), optimized.ndcgAt10());
+        assertEquals("QUERY_OPTIMIZATION", optimized.retrievalStrategy());
         Path output = temp.resolve("reports/report.json");
         evaluator.save(report, output);
         assertTrue(Files.readString(output).contains("\"rankingPolicyVersion\" : 3"));

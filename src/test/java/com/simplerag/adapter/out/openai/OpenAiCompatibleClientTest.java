@@ -88,9 +88,79 @@ class OpenAiCompatibleClientTest {
 
             assertTrue(decision.shouldSearch());
             // The duplicate the model emitted is dropped; the two distinct facets survive.
-            assertEquals(List.of("IterativeRetrieval collect", "planRetrieval callers"), decision.queries());
+            assertEquals(List.of("IterativeRetrieval collect", "planRetrieval callers"), decision.queryTexts());
+            // A bare string array carries no mode, which must keep meaning ordinary keyword retrieval.
+            assertTrue(decision.queries().stream()
+                    .allMatch(query -> query.mode() == RetrievalDecision.QueryMode.KEYWORD));
             // The planner needs the relevance score to judge "related but not sufficient".
             assertTrue(requestBody.get().contains("relevance 0.42"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void plannerParsesTypedQueriesAndRoutesAHypotheticalDocumentByMode() throws Exception {
+        AtomicReference<String> requestBody = new AtomicReference<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            requestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            respond(exchange, "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":"
+                    + "\"{\\\"action\\\":\\\"search\\\",\\\"queries\\\":["
+                    + "{\\\"text\\\":\\\"max_retries config key\\\",\\\"mode\\\":\\\"keyword\\\"},"
+                    + "{\\\"text\\\":\\\"Retry count is set by max_retries, default 3.\\\","
+                    + "\\\"mode\\\":\\\"Hypothetical\\\"},"
+                    + "{\\\"text\\\":\\\"backoff policy\\\"}]}\"}}]}");
+        });
+        server.start();
+        try {
+            ApiConfig config = new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1",
+                    "secret", "model");
+            RetrievalPlanRequest request = new RetrievalPlanRequest("kb", 1L, "how does retry work?",
+                    List.of(), List.of(), List.of(new RetrievalAttempt("retry", 0)), 3);
+
+            RetrievalDecision decision = new OpenAiCompatibleClient().planRetrieval(config, request);
+
+            assertTrue(decision.shouldSearch());
+            assertEquals(3, decision.queries().size());
+            assertEquals(RetrievalDecision.QueryMode.KEYWORD, decision.queries().get(0).mode());
+            // Mode matching is case-insensitive: models are inconsistent about capitalisation.
+            assertEquals(RetrievalDecision.QueryMode.HYPOTHETICAL, decision.queries().get(1).mode());
+            assertEquals("Retry count is set by max_retries, default 3.", decision.queries().get(1).text());
+            // A typed entry with no mode falls back to keyword rather than being dropped.
+            assertEquals(RetrievalDecision.QueryMode.KEYWORD, decision.queries().get(2).mode());
+            assertTrue(requestBody.get().contains("hypothetical"),
+                    "the planner must be told the mode exists before it can use it");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void plannerIsToldWhenVectorRetrievalIsUnavailable() throws Exception {
+        AtomicReference<String> withVectors = new AtomicReference<>();
+        AtomicReference<String> withoutVectors = new AtomicReference<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        AtomicReference<AtomicReference<String>> target = new AtomicReference<>(withVectors);
+        server.createContext("/v1/chat/completions", exchange -> {
+            target.get().set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            respond(exchange, "{\"choices\":[{\"message\":{\"content\":\"{\\\"action\\\":\\\"answer\\\"}\"}}]}");
+        });
+        server.start();
+        try {
+            ApiConfig config = new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1",
+                    "secret", "model");
+            List<RetrievalAttempt> attempts = List.of(new RetrievalAttempt("q", 0));
+            OpenAiCompatibleClient client = new OpenAiCompatibleClient();
+
+            client.planRetrieval(config, new RetrievalPlanRequest("kb", 1L, "q", List.of(), List.of(),
+                    attempts, 3, true));
+            target.set(withoutVectors);
+            client.planRetrieval(config, new RetrievalPlanRequest("kb", 1L, "q", List.of(), List.of(),
+                    attempts, 3, false));
+
+            assertFalse(withVectors.get().contains("Semantic (vector) retrieval is unavailable"));
+            assertTrue(withoutVectors.get().contains("emit keyword queries only"));
         } finally {
             server.stop(0);
         }
