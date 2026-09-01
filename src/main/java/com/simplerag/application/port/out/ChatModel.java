@@ -1,5 +1,6 @@
 package com.simplerag.application.port.out;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatRequest;
 import com.simplerag.application.conversation.RetrievalDecision;
 import com.simplerag.application.conversation.RetrievalPlanRequest;
@@ -35,10 +36,14 @@ public interface ChatModel {
     }
 
     default RagAnswer answerStream(ApiConfig config, String question, List<RagCitation> citations,
-                                   Consumer<String> onDelta) throws IOException, InterruptedException {
+                                   Consumer<AnswerDelta> onDelta) throws IOException, InterruptedException {
         return answerStream(config, new ChatRequest("legacy", 0L, question, List.of(), citations), onDelta);
     }
 
-    RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<String> onDelta)
+    /**
+     * Streams a turn as tagged {@link AnswerDelta} events. Reasoning models emit their chain of thought
+     * before any answer text, and the two must stay distinguishable all the way to the UI.
+     */
+    RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<AnswerDelta> onDelta)
             throws IOException, InterruptedException;
 }

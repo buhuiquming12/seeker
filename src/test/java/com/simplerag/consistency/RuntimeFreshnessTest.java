@@ -187,7 +187,7 @@ class RuntimeFreshnessTest {
             }
             @Override public com.simplerag.model.RagAnswer answerStream(ApiConfig config,
                     com.simplerag.application.conversation.ChatRequest request,
-                    java.util.function.Consumer<String> onDelta) {
+                    java.util.function.Consumer<com.simplerag.application.conversation.AnswerDelta> onDelta) {
                 return answer(config, request);
             }
         };

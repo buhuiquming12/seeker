@@ -56,6 +56,9 @@ class ApiSettingsModelConfigTest {
     private static final class NoopChat implements ChatModel {
         @Override public List<String> listModels(ApiConfig config) { return List.of(); }
         @Override public RagAnswer answer(ApiConfig config, ChatRequest request) { throw new UnsupportedOperationException(); }
-        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<String> onDelta) { throw new UnsupportedOperationException(); }
+        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request,
+                                                Consumer<com.simplerag.application.conversation.AnswerDelta> onDelta) {
+            throw new UnsupportedOperationException();
+        }
     }
 }

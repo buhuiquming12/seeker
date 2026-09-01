@@ -23,7 +23,7 @@ import java.util.Set;
  * ordinary hybrid way; a {@link QueryMode#HYPOTHETICAL} one is a HyDE pseudo-document, written as
  * though the answer were already known, and is retrieved by vector similarity alone.
  */
-public record RetrievalDecision(Action action, List<TypedQuery> queries, TokenUsage usage) {
+public record RetrievalDecision(Action action, List<TypedQuery> queries, TokenUsage usage, String reasoning) {
     /** One planning round may fan out this many generated queries. */
     public static final int MAX_QUERIES = 3;
     private static final int MAX_QUERY_LENGTH = 500;
@@ -61,6 +61,12 @@ public record RetrievalDecision(Action action, List<TypedQuery> queries, TokenUs
             throw new IllegalArgumentException("At least one search query is required");
         }
         usage = usage == null ? TokenUsage.UNKNOWN : usage;
+        reasoning = reasoning == null ? "" : reasoning;
+    }
+
+    /** Without a chain of thought — the shape every caller used before reasoning models were surfaced. */
+    public RetrievalDecision(Action action, List<TypedQuery> queries, TokenUsage usage) {
+        this(action, queries, usage, "");
     }
 
     /** Trims, drops blanks, caps length per mode, removes case-insensitive duplicates, bounds fan-out. */
@@ -114,7 +120,12 @@ public record RetrievalDecision(Action action, List<TypedQuery> queries, TokenUs
 
     /** Attaches what this planning round actually cost, so a turn can report its real total. */
     public RetrievalDecision withUsage(TokenUsage measured) {
-        return new RetrievalDecision(action, queries, measured);
+        return new RetrievalDecision(action, queries, measured, reasoning);
+    }
+
+    /** Attaches the planner's chain of thought, so the UI can show why it searched again. */
+    public RetrievalDecision withReasoning(String thought) {
+        return new RetrievalDecision(action, queries, usage, thought);
     }
 
     public boolean shouldSearch() {

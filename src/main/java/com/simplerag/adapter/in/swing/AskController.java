@@ -2,6 +2,7 @@ package com.simplerag.adapter.in.swing;
 
 import com.simplerag.application.port.in.AskKnowledge;
 import com.simplerag.application.port.in.ManageApiSettings;
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.conversation.ConversationSession;
 import com.simplerag.application.conversation.ConversationStore;
@@ -62,7 +63,7 @@ public final class AskController {
      */
     public AskResultView ask(KnowledgeController.TaskIdentity identity, String question, ApiConfig config,
                              Consumer<List<CitationView>> onCitations, RemoteSendAuthorizer authorizer,
-                             Consumer<String> onDelta)
+                             Consumer<AnswerDelta> onDelta)
             throws IOException, InterruptedException {
         ConversationSession session = sessionFor(identity);
         // Snapshot history before appending the current user turn so the model sees prior turns only.

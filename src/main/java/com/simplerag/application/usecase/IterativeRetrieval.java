@@ -1,5 +1,6 @@
 package com.simplerag.application.usecase;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.conversation.ConversationQueryResolver;
 import com.simplerag.application.conversation.RetrievalAttempt;
@@ -72,6 +73,22 @@ final class IterativeRetrieval {
                    Runnable beforeRemoteCall,
                    boolean semanticRetrievalAvailable)
             throws IOException, InterruptedException {
+        return collect(knowledgeBaseId, sourceRevision, question, history, config, search,
+                onCitationScopeChanged, beforeRemoteCall, semanticRetrievalAvailable, delta -> { });
+    }
+
+    /**
+     * @param onPlanning receives the planner's own reasoning and the queries it generated, so the user
+     *                   can see the loop working instead of inferring it from a citation count.
+     */
+    Result collect(String knowledgeBaseId, long sourceRevision, String question,
+                   List<ChatMessage> history, ApiConfig config,
+                   RetrievalFunction search,
+                   Consumer<List<RagCitation>> onCitationScopeChanged,
+                   Runnable beforeRemoteCall,
+                   boolean semanticRetrievalAvailable,
+                   Consumer<AnswerDelta> onPlanning)
+            throws IOException, InterruptedException {
         Map<String, Candidate> collected = new LinkedHashMap<>();
         List<RetrievalAttempt> attempts = new ArrayList<>();
         TokenUsage usage = TokenUsage.UNKNOWN;
@@ -99,19 +116,30 @@ final class IterativeRetrieval {
                 // Planning is an optimisation. Losing it costs recall; letting it abort the turn would
                 // cost the answer entirely, so fall back to the evidence already collected.
                 plannerUnavailable = true;
+                announce(onPlanning, "〔检索规划不可用：" + plannerUnreachable.getMessage() + "〕");
                 break;
             }
             if (decision == null) {
                 plannerUnavailable = true;
+                announce(onPlanning, "〔检索规划不可用：模型未返回决策〕");
                 break;
             }
             // A planning round is billed even when it decides to stop searching.
             usage = usage.plus(decision.usage());
+            if (!decision.reasoning().isBlank()) {
+                announce(onPlanning, "〔第 " + (searchNumber + 1) + " 轮检索规划〕\n" + decision.reasoning().strip());
+            }
             if (decision.plannerUnavailable()) {
                 plannerUnavailable = true;
+                // Naming this is the whole point: it used to look identical to "the evidence sufficed".
+                announce(onPlanning, "〔检索规划不可用：模型返回了无法解析的结果，已停止追加检索〕");
                 break;
             }
-            if (!decision.shouldSearch()) break;
+            if (!decision.shouldSearch()) {
+                announce(onPlanning, "〔模型判断现有证据已足够，停止检索〕");
+                break;
+            }
+            announce(onPlanning, plannedQueries(searchNumber + 1, decision));
 
             // The model may generate several queries for one round. Running them all before the next
             // planning call turns a purely sequential loop into a bounded fan-out, so a question with
@@ -144,6 +172,24 @@ final class IterativeRetrieval {
             if (collected.size() >= MAX_CITATIONS) break;
         }
         return new Result(citations, usage, plannerUnavailable);
+    }
+
+    private static void announce(Consumer<AnswerDelta> onPlanning, String note) {
+        if (onPlanning == null || note == null || note.isBlank()) return;
+        onPlanning.accept(AnswerDelta.planning(note.strip() + "\n"));
+    }
+
+    /**
+     * The queries the model wrote for itself, rendered for the thinking panel. This is the most direct
+     * evidence that self-directed retrieval ran at all, and it needs no streaming support from the
+     * provider — the decision already carries it.
+     */
+    private static String plannedQueries(int round, RetrievalDecision decision) {
+        StringBuilder note = new StringBuilder("〔第 ").append(round).append(" 轮检索〕");
+        for (RetrievalDecision.TypedQuery query : decision.queries()) {
+            note.append("\n  ").append(query.hypothetical() ? "假设文档：" : "关键词：").append(query.text());
+        }
+        return note.toString();
     }
 
     private static int addResults(Map<String, Candidate> collected, List<SearchResult> results, int limit) {

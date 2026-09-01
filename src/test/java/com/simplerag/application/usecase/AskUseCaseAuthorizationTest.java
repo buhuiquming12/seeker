@@ -140,7 +140,8 @@ class AskUseCaseAuthorizationTest {
         @Override public RagAnswer answer(ApiConfig config, ChatRequest request) {
             return new RagAnswer("answer", request.citations(), config.model());
         }
-        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<String> onDelta) {
+        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request,
+                                                Consumer<com.simplerag.application.conversation.AnswerDelta> onDelta) {
             return answer(config, request);
         }
         @Override public RetrievalDecision planRetrieval(ApiConfig config, RetrievalPlanRequest request)

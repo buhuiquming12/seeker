@@ -240,8 +240,11 @@ class KnowledgeServiceUnitTest {
         @Override public RagAnswer answer(ApiConfig config, ChatRequest request) {
             return new RagAnswer("fake answer", request.citations(), "fake");
         }
-        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<String> onDelta) {
-            if (onDelta != null) onDelta.accept("fake answer");
+        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request,
+                                                Consumer<com.simplerag.application.conversation.AnswerDelta> onDelta) {
+            if (onDelta != null) {
+                onDelta.accept(com.simplerag.application.conversation.AnswerDelta.answer("fake answer"));
+            }
             return answer(config, request);
         }
     }

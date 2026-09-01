@@ -1,5 +1,6 @@
 package com.simplerag.adapter.in.swing;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.dto.CitationView;
 import com.simplerag.rag.ApiConfig;
@@ -170,6 +171,24 @@ public final class AskPanel extends JPanel {
         return references.isBlank() ? answer : answer + "\n\n引用：\n" + references;
     }
 
+    /** Reasoning of the most recent assistant turn. Never part of the transcript or the clipboard. */
+    public String latestThinking() {
+        BubblePanel bubble = lastAssistantBubble();
+        return bubble == null ? "" : bubble.thinkingText();
+    }
+
+    public boolean assistantThinkingExpanded() {
+        BubblePanel bubble = lastAssistantBubble();
+        return bubble != null && bubble.thinkingExpanded();
+    }
+
+    private BubblePanel lastAssistantBubble() {
+        for (int index = bubbles.size() - 1; index >= 0; index--) {
+            if (!bubbles.get(index).user) return bubbles.get(index);
+        }
+        return null;
+    }
+
     public void showMessages(List<ChatMessage> messages) {
         resetTranscript();
         for (ChatMessage message : messages) {
@@ -191,28 +210,46 @@ public final class AskPanel extends JPanel {
         revalidateTranscript(true);
     }
 
-    public void appendAssistantDelta(String delta) {
+    public void appendAssistantDelta(AnswerDelta delta) {
+        if (delta == null || delta.isEmpty()) return;
         if (streamingAssistant == null) {
             removeEmptyState();
             streamingAssistant = addBubble(false, "", true);
         }
+        if (delta.reasoning()) {
+            streamingAssistant.appendThinking(delta.text());
+            conversationTitle(delta.stage() == AnswerDelta.Stage.PLANNING ? "AI 正在规划检索…" : "AI 正在思考…");
+            revalidateTranscript(true);
+            return;
+        }
         if (streamingAssistant.isEmpty()) {
+            // The answer has started, so the scratch work folds away by itself.
+            streamingAssistant.expandThinking(false);
             conversationTitle("正在生成回答…");
             conversationMeta("AI 已完成多轮检索 · 本轮引用 " + citations.size() + " 个片段");
         }
-        streamingAssistant.append(delta);
+        streamingAssistant.append(delta.text());
         revalidateTranscript(true);
     }
 
     public void finishAssistant(String fullText, String model) {
+        finishAssistant(fullText, model, "");
+    }
+
+    public void finishAssistant(String fullText, String model, String reasoning) {
         if (streamingAssistant != null) {
-            if (streamingAssistant.isEmpty() && fullText != null && !fullText.isBlank()) {
+            if (fullText != null && !fullText.isBlank() && streamingAssistant.isEmpty()) {
                 streamingAssistant.setText(fullText);
             }
+            // The non-streaming fallback reports its thinking only on the finished answer.
+            streamingAssistant.setThinking(reasoning);
+            streamingAssistant.expandThinking(false);
             streamingAssistant.setStreaming(false);
             streamingAssistant = null;
         } else if (fullText != null && !fullText.isBlank()) {
-            addBubble(false, fullText, false);
+            BubblePanel bubble = addBubble(false, fullText, false);
+            bubble.setThinking(reasoning);
+            bubble.expandThinking(false);
         }
         conversationTitle(model == null || model.isBlank() ? "对话" : "对话 · " + model);
         conversationMeta("多轮上下文与 AI 自主检索已启用 · 历史不含引用片段");
@@ -598,6 +635,12 @@ public final class AskPanel extends JPanel {
         private final boolean user;
         private final JTextArea body = new JTextArea();
         private final JLabel role = new JLabel();
+        /** Chain of thought and retrieval planning. Never part of {@link #text()}. */
+        private final JTextArea thinking = new JTextArea();
+        private final JButton thinkingToggle = new JButton();
+        private final JPanel thinkingSection = new JPanel(new BorderLayout(0, 4));
+        private boolean thinkingExpanded = true;
+        private long thinkingStartedNanos;
         private boolean streaming;
         private boolean error;
         private int availableWidth = 720;
@@ -633,12 +676,90 @@ public final class AskPanel extends JPanel {
             copy.setForeground(user ? new Color(9, 30, 25) : Theme.MUTED);
             copy.setFont(Theme.UI_FONT.deriveFont(9f));
             copy.setMargin(new Insets(0, 4, 0, 4));
+            // Deliberately body-only: thinking is scratch work and must not land in the clipboard.
             copy.addActionListener(event -> AskPanel.copy(body.getText()));
             header.add(copy, BorderLayout.EAST);
-            add(header, BorderLayout.NORTH);
+            JPanel north = new JPanel();
+            north.setOpaque(false);
+            north.setLayout(new BoxLayout(north, BoxLayout.Y_AXIS));
+            header.setAlignmentX(Component.LEFT_ALIGNMENT);
+            north.add(header);
+            north.add(buildThinkingSection());
+            add(north, BorderLayout.NORTH);
             add(body, BorderLayout.CENTER);
             setAlignmentX(user ? Component.RIGHT_ALIGNMENT : Component.LEFT_ALIGNMENT);
             setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
+        }
+
+        private JPanel buildThinkingSection() {
+            thinking.setEditable(false);
+            thinking.setLineWrap(true);
+            thinking.setWrapStyleWord(true);
+            thinking.setOpaque(false);
+            thinking.setFont(Theme.UI_FONT.deriveFont(11f));
+            thinking.setForeground(Theme.MUTED);
+            thinking.setBorder(new EmptyBorder(0, 8, 0, 0));
+            thinking.setFocusable(true);
+            thinkingToggle.setFocusable(false);
+            thinkingToggle.setBorderPainted(false);
+            thinkingToggle.setContentAreaFilled(false);
+            thinkingToggle.setForeground(Theme.MUTED);
+            thinkingToggle.setFont(Theme.UI_FONT.deriveFont(10f));
+            thinkingToggle.setMargin(new Insets(0, 0, 0, 0));
+            thinkingToggle.setHorizontalAlignment(javax.swing.SwingConstants.LEFT);
+            thinkingToggle.addActionListener(event -> expandThinking(!thinkingExpanded));
+            thinkingSection.setOpaque(false);
+            thinkingSection.setAlignmentX(Component.LEFT_ALIGNMENT);
+            thinkingSection.add(thinkingToggle, BorderLayout.NORTH);
+            thinkingSection.add(thinking, BorderLayout.CENTER);
+            thinkingSection.setVisible(false);
+            return thinkingSection;
+        }
+
+        /** Appends one piece of reasoning, revealing the section the first time anything arrives. */
+        void appendThinking(String delta) {
+            if (delta == null || delta.isEmpty()) return;
+            if (!thinkingSection.isVisible()) {
+                thinkingSection.setVisible(true);
+                thinkingStartedNanos = System.nanoTime();
+            }
+            thinking.append(delta);
+            refreshThinkingLabel();
+            invalidate();
+        }
+
+        void setThinking(String text) {
+            if (text == null || text.isBlank() || !thinking.getText().isBlank()) return;
+            thinkingSection.setVisible(true);
+            if (thinkingStartedNanos == 0L) thinkingStartedNanos = System.nanoTime();
+            thinking.setText(text);
+            refreshThinkingLabel();
+            invalidate();
+        }
+
+        void expandThinking(boolean expanded) {
+            if (!thinkingSection.isVisible()) return;
+            thinkingExpanded = expanded;
+            thinking.setVisible(expanded);
+            refreshThinkingLabel();
+            invalidate();
+            revalidate();
+            repaint();
+        }
+
+        boolean thinkingExpanded() {
+            return thinkingSection.isVisible() && thinkingExpanded;
+        }
+
+        String thinkingText() {
+            return thinking.getText();
+        }
+
+        private void refreshThinkingLabel() {
+            long seconds = thinkingStartedNanos == 0L ? 0L
+                    : (System.nanoTime() - thinkingStartedNanos) / 1_000_000_000L;
+            thinkingToggle.setText((thinkingExpanded ? "▾ 思考过程" : "▸ 思考过程")
+                    + (seconds > 0 ? " · " + seconds + "s" : ""));
         }
 
         String text() { return body.getText(); }
@@ -706,15 +827,31 @@ public final class AskPanel extends JPanel {
             body.setSize(new Dimension(contentWidth, Short.MAX_VALUE));
             Dimension bodySize = body.getPreferredSize();
             int height = bodySize.height + role.getPreferredSize().height + BUBBLE_INNER_PAD_Y * 2 + 8;
+            // BorderLayout would happily clip the thinking area otherwise: this panel reports its own
+            // preferred size, so anything not counted here simply does not get drawn.
+            height += thinkingHeight(contentWidth);
             if (streaming) {
                 height = Math.max(height, 56);
             }
             return new Dimension(bubbleWidth, height);
         }
 
+        private int thinkingHeight(int contentWidth) {
+            if (!thinkingSection.isVisible()) return 0;
+            int height = thinkingToggle.getPreferredSize().height + 4;
+            if (thinkingExpanded) {
+                thinking.setSize(new Dimension(contentWidth, Short.MAX_VALUE));
+                height += thinking.getPreferredSize().height + 6;
+            }
+            return height;
+        }
+
         private int preferredBubbleWidth() {
             int max = maxBubbleWidth();
             String text = body.getText();
+            // Reasoning is long and wraps badly in a narrow bubble, so an expanded thinking area takes
+            // the full column even before the first answer token arrives.
+            if (!user && thinkingExpanded()) return max;
             if (text == null || text.isBlank()) {
                 return user ? Math.min(max, 220) : Math.min(max, Math.max(280, availableWidth * 70 / 100));
             }

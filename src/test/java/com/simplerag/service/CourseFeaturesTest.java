@@ -74,7 +74,7 @@ public final class CourseFeaturesTest {
         StringBuilder streamed = new StringBuilder();
         AtomicReference<List<?>> streamedCitations = new AtomicReference<>();
         RagAnswer streamAnswer = service.askStream("How should MySQL credentials be stored?", config,
-                streamedCitations::set, streamed::append);
+                streamedCitations::set, delta -> streamed.append(delta.text()));
         check(streamedCitations.get() != null && !streamedCitations.get().isEmpty(),
                 "流式问答应先返回引用");
         check(streamed.toString().equals("Store credentials in environment variables [1]."),

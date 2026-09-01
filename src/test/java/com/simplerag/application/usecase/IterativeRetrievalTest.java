@@ -1,5 +1,6 @@
 package com.simplerag.application.usecase;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.conversation.ChatRequest;
 import com.simplerag.application.conversation.RetrievalDecision;
@@ -214,6 +215,51 @@ class IterativeRetrievalTest {
         assertEquals(List.of(false), withoutVectors.semanticFlags);
     }
 
+    @Test
+    void theQueriesTheModelWroteForItselfAreAnnouncedAsPlanningDeltas() throws Exception {
+        // Self-directed retrieval used to be invisible: the only hint it ran was the citation count.
+        PlanningChat chat = new PlanningChat(List.of(
+                RetrievalDecision.plan(List.of(
+                        new RetrievalDecision.TypedQuery("ChunkerRegistry 注册",
+                                RetrievalDecision.QueryMode.KEYWORD),
+                        new RetrievalDecision.TypedQuery("索引发布时会写入 manifest",
+                                RetrievalDecision.QueryMode.HYPOTHETICAL)))
+                        .withReasoning("证据里缺少发布环节"),
+                RetrievalDecision.answer()));
+        IterativeRetrieval retrieval = new IterativeRetrieval(chat);
+        StringBuilder planning = new StringBuilder();
+
+        retrieval.collect("kb", 1L, "索引怎么构建？", List.of(), CONFIG,
+                (query, strategy) -> List.of(hit(query.substring(0, Math.min(2, query.length())), 0.9)),
+                ignored -> { }, () -> { }, true,
+                delta -> {
+                    assertEquals(AnswerDelta.Stage.PLANNING, delta.stage());
+                    planning.append(delta.text());
+                });
+
+        String announced = planning.toString();
+        assertTrue(announced.contains("证据里缺少发布环节"), "planner reasoning should reach the UI");
+        assertTrue(announced.contains("关键词：ChunkerRegistry 注册"), "generated keyword query should be shown");
+        assertTrue(announced.contains("假设文档：索引发布时会写入 manifest"), "HyDE query should be labelled as such");
+        assertTrue(announced.contains("模型判断现有证据已足够"), "stopping on purpose should be stated");
+    }
+
+    @Test
+    void anUnusablePlanIsAnnouncedInsteadOfLookingLikeASatisfiedModel() throws Exception {
+        // unavailable and answer both stop the loop; only one of them is a failure, and the user could
+        // not previously tell which had happened.
+        PlanningChat chat = new PlanningChat(List.of(RetrievalDecision.unavailable()));
+        IterativeRetrieval retrieval = new IterativeRetrieval(chat);
+        StringBuilder planning = new StringBuilder();
+
+        IterativeRetrieval.Result result = retrieval.collect("kb", 1L, "问题", List.of(), CONFIG,
+                (query, strategy) -> List.of(hit("c1", 0.9)), ignored -> { }, () -> { }, true,
+                delta -> planning.append(delta.text()));
+
+        assertTrue(result.plannerUnavailable());
+        assertTrue(planning.toString().contains("检索规划不可用"));
+    }
+
     private static SearchResult hit(String id, double score) {
         DocumentChunk chunk = new DocumentChunk(id, "docs/" + id + ".md", "docs", id + ".md", ".md",
                 1, 3, "content for " + id, 1L, null);
@@ -231,7 +277,8 @@ class IterativeRetrievalTest {
         @Override public RagAnswer answer(ApiConfig config, ChatRequest request) {
             return new RagAnswer("answer", request.citations(), config.model());
         }
-        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<String> onDelta) {
+        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request,
+                                                Consumer<AnswerDelta> onDelta) {
             return answer(config, request);
         }
         @Override public RetrievalDecision planRetrieval(ApiConfig config, RetrievalPlanRequest request)
@@ -254,7 +301,8 @@ class IterativeRetrievalTest {
         @Override public RagAnswer answer(ApiConfig config, ChatRequest request) {
             return new RagAnswer("answer", request.citations(), config.model());
         }
-        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request, Consumer<String> onDelta) {
+        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request,
+                                                Consumer<AnswerDelta> onDelta) {
             return answer(config, request);
         }
         @Override public RetrievalDecision planRetrieval(ApiConfig config, RetrievalPlanRequest request) {

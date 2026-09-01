@@ -25,6 +25,7 @@ import com.simplerag.application.freshness.SourceFingerprint;
 import com.simplerag.application.runtime.ActiveKnowledgeContext;
 import com.simplerag.application.runtime.ActiveKnowledgeRuntime;
 import com.simplerag.application.runtime.IndexLifecycle;
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.conversation.ChatRequest;
 import com.simplerag.application.dto.AskResultView;
@@ -324,7 +325,7 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
      * chunk of the generated text.
      */
     public RagAnswer askStream(String question, ApiConfig config, Consumer<List<RagCitation>> onCitations,
-                               Consumer<String> onDelta) throws IOException, InterruptedException {
+                               Consumer<AnswerDelta> onDelta) throws IOException, InterruptedException {
         IndexHandle handle = requireReadyHandle();
         List<RagCitation> citations = retrieveCitations(handle, question);
         if (onCitations != null) onCitations.accept(citations);
@@ -338,7 +339,7 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
     public AskResultView askStream(String knowledgeBaseId, long expectedRevision, String question,
                                    List<ChatMessage> history, ApiConfig config,
                                    Consumer<List<CitationView>> onCitations, RemoteSendAuthorizer authorizer,
-                                   Consumer<String> onDelta)
+                                   Consumer<AnswerDelta> onDelta)
             throws IOException, InterruptedException {
         IndexHandle handle = requireReadyHandle(knowledgeBaseId, expectedRevision);
         List<RagCitation> citations = retrieveCitations(handle, question);

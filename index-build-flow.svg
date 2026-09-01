@@ -1,0 +1,259 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 2200" font-family="Microsoft YaHei, PingFang SC, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <style>
+    .t { font-size:15px; font-weight:bold; fill:#1e293b }
+    .d { font-size:13px; fill:#475569 }
+    .diamond { fill:#fffbeb; stroke:#f59e0b; stroke-width:1.5 }
+    .diamond text { font-size:14px; font-weight:bold; fill:#92400e }
+    .arrow { stroke:#64748b; stroke-width:1.8; fill:none; marker-end:url(#arrow) }
+    .arrowRed { stroke:#dc2626; stroke-width:1.8; fill:none; marker-end:url(#arrowRed) }
+    .branch { font-size:12.5px; font-weight:bold; fill:#dc2626 }
+    .branchDown { font-size:12.5px; font-weight:bold; fill:#16a34a }
+    .note { font-size:12.5px; fill:#78716c; font-style:italic }
+    .laneA { fill:#eff6ff; fill-opacity:0.55; stroke:#bfdbfe; stroke-width:1.5; stroke-dasharray:6 5 }
+    .laneB { fill:#ecfdf5; fill-opacity:0.55; stroke:#a7f3d0; stroke-width:1.5; stroke-dasharray:6 5 }
+    .laneC { fill:#f5f3ff; fill-opacity:0.55; stroke:#ddd6fe; stroke-width:1.5; stroke-dasharray:6 5 }
+    .laneD { fill:#fff7ed; fill-opacity:0.55; stroke:#fed7aa; stroke-width:1.5; stroke-dasharray:6 5 }
+    .laneFail { fill:#fef2f2; fill-opacity:0.6; stroke:#fecaca; stroke-width:1.5; stroke-dasharray:6 5 }
+    .phaseA { font-size:15px; font-weight:bold; fill:#2563eb }
+    .phaseB { font-size:15px; font-weight:bold; fill:#16a34a }
+    .phaseC { font-size:15px; font-weight:bold; fill:#7c3aed }
+    .phaseD { font-size:15px; font-weight:bold; fill:#ea580c }
+    .failHeader { font-size:14px; font-weight:bold; fill:#dc2626 }
+    .failTitle { font-size:14px; font-weight:bold; fill:#b91c1c }
+  </style>
+
+  <!-- 标题 -->
+  <text x="120" y="32" font-size="26" font-weight="bold" fill="#0f172a">SimpleRAG · 索引建立流程</text>
+  <text x="120" y="58" font-size="13" fill="#64748b">IncrementalIndexBuilder 增量构建 → 原子落盘 → SQLite 事务发布;失败路径见右侧</text>
+
+  <!-- 图例 -->
+  <g font-size="12" fill="#475569">
+    <rect x="880" y="16" width="22" height="14" rx="3" fill="#ffffff" stroke="#94a3b8"/>
+    <text x="910" y="28">处理步骤</text>
+    <polygon points="1032,30 1046,23 1060,30 1046,37" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+    <text x="1068" y="32">判断/分支</text>
+    <rect x="880" y="40" width="22" height="14" rx="3" fill="#fef2f2" stroke="#dc2626"/>
+    <text x="910" y="52">失败路径</text>
+  </g>
+
+  <!-- ===== 阶段A ===== -->
+  <text x="120" y="78" class="phaseA">阶段A · 触发与准备</text>
+  <rect x="100" y="88" width="560" height="516" class="laneA"/>
+
+  <!-- 1 触发 -->
+  <g>
+    <rect x="120" y="104" width="520" height="84" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="380" y="130" class="t" fill="#1d4ed8" text-anchor="middle">触发:重建索引请求</text>
+    <text x="380" y="152" class="d" text-anchor="middle">用户点击"重建索引" · 文件监听器 · 定期 reconciliation</text>
+    <text x="380" y="172" class="d" text-anchor="middle">检测到源文件变化 → source_revision+1 → 状态 = DIRTY</text>
+  </g>
+  <line x1="380" y1="188" x2="380" y2="218" class="arrow"/>
+
+  <!-- 2 捕获身份 -->
+  <g>
+    <rect x="120" y="218" width="520" height="66" rx="10" class="node"/>
+    <text x="380" y="244" class="t" text-anchor="middle">捕获不可变构建身份</text>
+    <text x="380" y="266" class="d" text-anchor="middle">kbId + sourceRevision + sourceSetHash + embeddingModelSignature</text>
+  </g>
+  <line x1="380" y1="284" x2="380" y2="314" class="arrow"/>
+
+  <!-- 3 加载上一快照 -->
+  <g>
+    <rect x="120" y="314" width="520" height="66" rx="10" class="node"/>
+    <text x="380" y="340" class="t" text-anchor="middle">加载上一已发布快照</text>
+    <text x="380" y="362" class="d" text-anchor="middle">读取上一 revision 的 IndexSnapshot,按文件 key 建立复用映射</text>
+  </g>
+  <line x1="380" y1="380" x2="380" y2="410" class="arrow"/>
+
+  <!-- 4 分配 revision -->
+  <g>
+    <polygon points="380,410 600,458 380,506 160,458" class="diamond"/>
+    <text x="380" y="450" text-anchor="middle">分配构建 revision</text>
+    <text x="380" y="470" font-size="12.5" font-weight="normal" fill="#92400e" text-anchor="middle">SQLite 事务:校验通过则 source_revision+1</text>
+    <text x="380" y="487" font-size="12.5" font-weight="normal" fill="#92400e" text-anchor="middle">状态 → BUILDING(beginIndexBuildRevision)</text>
+  </g>
+  <text x="616" y="452" class="note">返回 null → 数据源已变化,</text>
+  <text x="616" y="470" class="note">抛 StaleTaskException</text>
+  <line x1="380" y1="506" x2="380" y2="536" class="arrow"/>
+
+  <!-- 5 构建请求 -->
+  <g>
+    <rect x="120" y="536" width="520" height="66" rx="10" class="node"/>
+    <text x="380" y="562" class="t" text-anchor="middle">构造 IndexBuildRequest 并启动监控</text>
+    <text x="380" y="584" class="d" text-anchor="middle">锁定 revision / sources / sourceHash / embedding 模型签名</text>
+  </g>
+  <line x1="380" y1="602" x2="380" y2="652" class="arrow"/>
+
+  <!-- ===== 阶段B ===== -->
+  <text x="120" y="626" class="phaseB">阶段B · 增量构建(IncrementalIndexBuilder.build)</text>
+  <rect x="100" y="636" width="560" height="662" class="laneB"/>
+
+  <!-- 6 扫描 -->
+  <g>
+    <rect x="120" y="656" width="520" height="70" rx="10" class="node"/>
+    <text x="380" y="682" class="t" text-anchor="middle">扫描 DocumentScanner.scan</text>
+    <text x="380" y="704" class="d" text-anchor="middle">递归扫描全部源目录,按 DocumentReader 匹配文件,产出警告</text>
+  </g>
+  <line x1="380" y1="726" x2="380" y2="756" class="arrow"/>
+
+  <!-- 7 指纹 -->
+  <g>
+    <rect x="120" y="756" width="520" height="80" rx="10" class="node"/>
+    <text x="380" y="782" class="t" text-anchor="middle">指纹 FileFingerprint</text>
+    <text x="380" y="804" class="d" text-anchor="middle">逐文件捕获 readerId/版本、大小、mtime、SHA-256</text>
+    <text x="380" y="824" class="d" text-anchor="middle">无法读取元数据 → 跳过(skipped)+ 逐文件警告</text>
+  </g>
+  <line x1="380" y1="836" x2="380" y2="866" class="arrow"/>
+
+  <!-- 8 增量计划 -->
+  <g>
+    <polygon points="380,866 600,914 380,962 160,914" class="diamond"/>
+    <text x="380" y="906" text-anchor="middle">增量计划 IncrementalIndexPlanner</text>
+    <text x="380" y="926" font-size="12.5" font-weight="normal" fill="#92400e" text-anchor="middle">比对上一快照条目:added / modified /</text>
+    <text x="380" y="943" font-size="12.5" font-weight="normal" fill="#92400e" text-anchor="middle">reused / deleted</text>
+  </g>
+  <text x="616" y="890" class="note">reused 条件:指纹、reader、chunker</text>
+  <text x="616" y="908" class="note">版本一致且 embedding 签名兼容</text>
+  <text x="616" y="926" class="note">→ 沿用 chunks,不重复读取</text>
+  <text x="616" y="944" class="note">deleted → 不进新快照</text>
+  <line x1="380" y1="962" x2="380" y2="992" class="arrow"/>
+
+  <!-- 9 读取+分块 -->
+  <g>
+    <rect x="120" y="992" width="520" height="96" rx="10" class="node"/>
+    <text x="380" y="1018" class="t" text-anchor="middle">读取+分块 readAndChunk(并行)</text>
+    <text x="380" y="1040" class="d" text-anchor="middle">reused 文件:直接沿用上一版 chunks,不再读取</text>
+    <text x="380" y="1060" class="d" text-anchor="middle">其余:多线程(CPU-1,≤32) reader.read + chunker.chunk</text>
+    <text x="380" y="1080" class="d" text-anchor="middle">读取失败 → 跳过+警告;结果按原扫描顺序收集</text>
+  </g>
+  <line x1="380" y1="1088" x2="380" y2="1118" class="arrow"/>
+
+  <!-- 10 向量化 -->
+  <g>
+    <rect x="120" y="1118" width="520" height="80" rx="10" class="node"/>
+    <text x="380" y="1144" class="t" text-anchor="middle">向量化 embedNewChunks</text>
+    <text x="380" y="1166" class="d" text-anchor="middle">仅新 chunk:每批 24 个 embedder.embed(文件名+位置+内容)</text>
+    <text x="380" y="1186" class="d" text-anchor="middle">复用 chunk 沿用上一版向量;模型未配置则跳过</text>
+  </g>
+  <line x1="380" y1="1198" x2="380" y2="1228" class="arrow"/>
+
+  <!-- 11 组装 -->
+  <g>
+    <rect x="120" y="1228" width="520" height="66" rx="10" class="node"/>
+    <text x="380" y="1254" class="t" text-anchor="middle">组装 BuildResult</text>
+    <text x="380" y="1276" class="d" text-anchor="middle">汇总 entries + completeChunks + IndexReport(各阶段耗时)</text>
+  </g>
+  <line x1="380" y1="1294" x2="380" y2="1348" class="arrow"/>
+
+  <!-- ===== 阶段C ===== -->
+  <text x="120" y="1328" class="phaseC">阶段C · 校验与持久化</text>
+  <rect x="100" y="1338" width="560" height="306" class="laneC"/>
+
+  <!-- 12 manifest -->
+  <g>
+    <rect x="120" y="1358" width="520" height="70" rx="10" class="node"/>
+    <text x="380" y="1384" class="t" text-anchor="middle">构建 IndexManifest 并复核源</text>
+    <text x="380" y="1406" class="d" text-anchor="middle">重算 sourceSetHash;写入 kbId/revision/哈希/签名/维度等</text>
+  </g>
+  <line x1="380" y1="1428" x2="380" y2="1440" class="arrow"/>
+
+  <!-- 13 校验 -->
+  <g>
+    <polygon points="380,1440 600,1488 380,1536 160,1488" class="diamond"/>
+    <text x="380" y="1480" text-anchor="middle">校验:构建期间源是否变化?</text>
+    <text x="380" y="1500" font-size="12.5" font-weight="normal" fill="#92400e" text-anchor="middle">当前 sourceSetHash ≠ 捕获值 → 结果作废</text>
+  </g>
+
+  <!-- 失败路径 lane -->
+  <rect x="672" y="1390" width="460" height="506" class="laneFail"/>
+  <text x="682" y="1412" class="failHeader">失败路径 · 异常处理</text>
+
+  <!-- 13 失败分支 -->
+  <line x1="600" y1="1488" x2="672" y2="1488" class="arrowRed"/>
+  <text x="614" y="1480" class="branch">是:变化</text>
+  <text x="392" y="1548" class="branchDown">否:未变化</text>
+  <line x1="380" y1="1536" x2="380" y2="1560" class="arrow"/>
+
+  <!-- 失败A -->
+  <g>
+    <rect x="672" y="1450" width="460" height="76" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+    <text x="902" y="1474" class="failTitle" text-anchor="middle">源变化 → 结果作废</text>
+    <text x="902" y="1496" class="d" fill="#b91c1c" text-anchor="middle">抛 StaleTaskException → markIndexDirty(状态=DIRTY)</text>
+    <text x="902" y="1514" class="d" fill="#b91c1c" text-anchor="middle">半成品 .bin.tmp 不发布、随后清理</text>
+  </g>
+
+  <!-- 14 落盘 -->
+  <g>
+    <rect x="120" y="1560" width="520" height="80" rx="10" class="node"/>
+    <text x="380" y="1586" class="t" text-anchor="middle">落盘 IndexStore.saveRevision</text>
+    <text x="380" y="1608" class="d" text-anchor="middle">序列化写入 &lt;revision&gt;.bin.tmp</text>
+    <text x="380" y="1628" class="d" text-anchor="middle">完整关闭后 ATOMIC_MOVE 原子发布 &lt;revision&gt;.bin</text>
+  </g>
+  <line x1="380" y1="1640" x2="380" y2="1692" class="arrow"/>
+
+  <!-- ===== 阶段D ===== -->
+  <text x="120" y="1676" class="phaseD">阶段D · 发布与激活</text>
+  <rect x="100" y="1686" width="560" height="410" class="laneD"/>
+
+  <!-- 15 发布事务 -->
+  <g>
+    <rect x="120" y="1692" width="520" height="78" rx="10" class="node"/>
+    <text x="380" y="1718" class="t" text-anchor="middle">发布 publishIndex(SQLite 事务)</text>
+    <text x="380" y="1740" class="d" text-anchor="middle">INSERT knowledge_index(该 revision 记录)</text>
+    <text x="380" y="1760" class="d" text-anchor="middle">UPDATE knowledge_base → published_index_revision,状态=READY</text>
+  </g>
+  <line x1="380" y1="1770" x2="380" y2="1800" class="arrow"/>
+
+  <!-- 16 发布校验 -->
+  <g>
+    <polygon points="380,1800 600,1848 380,1896 160,1848" class="diamond"/>
+    <text x="380" y="1840" text-anchor="middle">发布校验</text>
+    <text x="380" y="1860" font-size="12.5" font-weight="normal" fill="#92400e" text-anchor="middle">事务内 source_revision 匹配且 status=BUILDING?</text>
+  </g>
+
+  <!-- 16 失败分支 -->
+  <line x1="600" y1="1848" x2="672" y2="1848" class="arrowRed"/>
+  <text x="614" y="1840" class="branch">否:失败</text>
+  <text x="392" y="1908" class="branchDown">是:成功</text>
+  <line x1="380" y1="1896" x2="380" y2="1930" class="arrow"/>
+
+  <!-- 失败B -->
+  <g>
+    <rect x="672" y="1810" width="460" height="76" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="1.5"/>
+    <text x="902" y="1834" class="failTitle" text-anchor="middle">发布失败</text>
+    <text x="902" y="1856" class="d" fill="#b91c1c" text-anchor="middle">删除该 revision 文件 + 抛 StaleTaskException</text>
+    <text x="902" y="1874" class="d" fill="#b91c1c" text-anchor="middle">markIndexDirty → 状态 = DIRTY</text>
+  </g>
+
+  <!-- 17 内存切换 -->
+  <g>
+    <rect x="120" y="1930" width="520" height="66" rx="10" class="node"/>
+    <text x="380" y="1956" class="t" text-anchor="middle">内存切换 runtime.publish</text>
+    <text x="380" y="1978" class="d" text-anchor="middle">活动索引切换到新 snapshot;发布后 freshness 监控</text>
+  </g>
+  <line x1="380" y1="1996" x2="380" y2="2026" class="arrow"/>
+
+  <!-- 18 完成 -->
+  <g>
+    <rect x="120" y="2026" width="520" height="64" rx="12" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <text x="380" y="2052" class="t" fill="#166534" text-anchor="middle">完成:索引 READY</text>
+    <text x="380" y="2074" class="d" fill="#166534" text-anchor="middle">远程 RAG 解锁;记录诊断与各阶段耗时</text>
+  </g>
+
+  <!-- 通用异常处理 -->
+  <g>
+    <rect x="100" y="2112" width="1032" height="76" rx="12" fill="#fef2f2" stroke="#f87171" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="120" y="2136" class="failHeader">构建异常统一处理(KnowledgeService.rebuild 捕获)</text>
+    <text x="120" y="2158" class="d" fill="#b91c1c">取消 / 源变化(StaleTaskException · InterruptedIOException)→ markIndexDirty(状态=DIRTY);其他异常 → markIndexBuildFailed(状态=FAILED)</text>
+    <text x="120" y="2178" class="d" fill="#b91c1c">已发布 revision 保持不变 · 半成品不会成为活动索引 · .tmp 被清理 · 远程 RAG 被禁止</text>
+  </g>
+</svg>

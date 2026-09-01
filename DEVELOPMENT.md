@@ -885,3 +885,91 @@ ChunkerRegistry.CHUNKING_VERSION 提升到 3。普通文档以约 320 token 为�
 ContextSelector 在生成上下文前执行 MMR，多样性选择中每个文档最多两个片段；随后按同父章节扩展相邻块，拒绝重叠行号并把单个扩展上下文限制为 2800 字符。IterativeRetrieval 额外拒绝同文件重叠达到 50% 的引用范围，且每个文档最多累计三个引用。
 
 评测集扩到 45 条并增加 dev/test、category、hard negatives 和 answerable 字段。报告新增 Recall@20、HitRate@5、Precision@5、文档唯一率、分类聚合、hard-negative 排序信号和 P50/P95；RetrievalEvaluationMain 同时输出默认策略报告和四策略消融报告。本机真实 ONNX 门禁结果为 Recall@5 1.000、Recall@20 1.000、HitRate@5 1.000、MRR@10 1.000、nDCG@10 0.956。
+
+## 25. 推理模型下的自主检索修复与思维链外显（2026-09-01）
+
+### 25.1 问题：自主检索从未真正触发过
+
+用户反馈"AI 自己检索自己用没有触发过"。接线是对的（`AppCompositionRoot` → `AskController` → `AskUseCase.askStream` → `IterativeRetrieval.collect` → `OpenAiCompatibleClient.planRetrieval`），`IterativeRetrievalTest` 与 `OpenAiCompatibleClientTest` 当时也全绿——故障只发生在运行时，且**只发生在带思维链的推理模型上**。
+
+失效链条是：规划轮写死 `PLANNER_MAX_TOKENS = 512` → 模型的思维链先把这份预算耗尽 → 响应带 `finish_reason=length` → `parseRetrievalDecision` 判为 `unavailable` → `IterativeRetrieval` 静默 `break`。
+
+结果是一个只对强模型生效的退化：**模型自主生成检索词的能力从第 2 轮才存在，而第 2 轮从未成功过**。第一轮永远用用户原话检索，看起来一切正常。
+
+这条链路上没有任何一处读取 `reasoning_content`，所以思维链既烧掉了 token 预算，又一个字都没到用户眼前——这也是它能长期隐身的原因。
+
+### 25.2 第二层：缓冲响应让预算修复变成超时
+
+把上限提到 4096 后，真实诊断报告给出的不是成功而是新的失败：
+
+```text
+"message" : "retrieval-plan",
+"outcome" : "HttpTimeoutException",
+"latencyMs" : "60028"
+```
+
+决定性对比在同一份报告里：同一模型的回答调用 `chat-stream` **6.6 秒**产出 526 个 completion token（约 80 tok/s），规划轮却 60 秒没有返回。
+
+两条差异共同解释了它。其一，规划轮当时是非流式的，而 `HttpRequest.timeout()` 对缓冲响应覆盖的是**整个响应体**；回答调用走 `BodyHandlers.ofInputStream()`，超时只算到响应头，所以从不撞这堵墙。其二，按实测速率，思考满 4096 token 恰好约 51 秒——512 → 4096 并没有解决问题，只是把"被截断"换成了"想得更久"，然后撞上时钟。
+
+单纯再抬超时无法收敛：一轮问答最多 3 次规划，每次一分钟。
+
+### 25.3 规划轮：流式化并默认关闭思考
+
+`planRetrieval` 现在发 `stream:true`（含 `stream_options.include_usage`）。这既绕开整响应超时，又把 `PLANNER_TIMEOUT`（60s）**重新用作读取截止时间**——绕过请求超时不能换来一个可以无限挂起的连接，所以 60 秒仍是硬上限，只是它现在计的是"真的没有数据"而不是"模型还在思考"。
+
+第一次尝试默认带 `enable_thinking:false` + `reasoning_effort:"low"`。规划只需要吐出一个很小的 JSON，思维链在这里买不到任何东西，却要花掉整整一分钟墙钟。这两个字段是厂商私有扩展而非 OpenAI schema 的一部分，严格网关会直接 4xx；因此回退方向是：**被拒绝就用标准 schema 重发一次**，只有在那条回退路径上、且结果仍被截断时，才再走一次"关思考重试"。
+
+`readPlannerResponse` 同时接受两种响应形状：老实流式的 SSE 帧，以及**悄悄忽略 `stream:true` 直接返回单个 JSON 对象**的服务端。"OpenAI 兼容"不保证其中任何一种，且缓冲那条路径正好被既有的几条规划测试覆盖。
+
+`PLANNER_MAX_TOKENS` 保留在 4096：回退路径上思考仍是开着的，需要这份余量。
+
+### 25.4 思维链外显
+
+新增 `application.conversation.AnswerDelta`，把原先的 `Consumer<String> onDelta` 换成带 stage 的事件流：
+
+| stage | 含义 |
+| --- | --- |
+| `PLANNING` | 检索规划的思考，以及**它自己生成的检索词** |
+| `ANSWER_THINKING` | 生成最终答案前的思维链 |
+| `ANSWER` | 答案正文 |
+
+该类型放在 `application.conversation`（与 `ChatMessage`/`RetrievalDecision` 同包），因为 port.out 和 adapter 都要用它，而 ArchUnit 禁止 application 依赖 adapter。签名贯通 `AskKnowledge`、`ChatModel`、`AskUseCase`、`KnowledgeService`、`AskController` 与 `DesktopWorkspaceController`。
+
+适配层按两种厂商约定解析：`extractReasoning` 依次尝试 `reasoning_content`（DeepSeek / Qwen / vLLM / 硅基流动）和 `reasoning`（OpenRouter）；`ThinkTagSplitter` 处理把思维链内联在 `content` 里的 `<think>…</think>` 服务端（Ollama / LM Studio）。后者必须跨 SSE 分片保持状态——`<thi` 和 `nk>` 常常分属两帧，把半个标签当正文发出去会污染每一轮回答。它还有一条克制规则：**只有在尚未产出任何正文时才认开标签**，此后出现的 `<think>` 更可能是被索引文档里的字面量，吞掉它会吃掉答案。
+
+`RagAnswer` 与 `AskResultView` 各增 `reasoning` 字段，供 SSE 兜底到非流式时补上思考。**`text()` 始终不含思维链**——多轮历史、剪贴板与引用导出全部依赖它。
+
+### 25.5 让"自主检索"变成可观测的
+
+`IterativeRetrieval` 每轮规划后主动播报，不依赖模型的流式支持——这些内容直接由 `decision.queries()` 拼出：
+
+```text
+〔第 2 轮检索规划〕
+证据里只有 Chunker，缺少发布环节
+〔第 2 轮检索〕
+  关键词：ChunkerRegistry 注册
+  假设文档：索引发布时会写入 manifest
+```
+
+规划失败同样被明确命名（`〔检索规划不可用：…〕`）。这正是当初让问题隐身的盲点：`UNAVAILABLE` 与 `ANSWER` 都停止循环，但只有后者意味着"模型认为证据够了"，而用户此前无法区分二者。
+
+UI 侧 `AskPanel.BubblePanel` 在正文上方加折叠思考区，流式时展开、正文一开始自动收起。`measure()` 必须计入其高度——该面板自报 preferred size，没被算进去的部分不会被绘制。复制按钮与右键菜单继续只取正文。
+
+### 25.6 验证
+
+```powershell
+mvn.cmd -q test
+```
+
+JUnit/ArchUnit 共 163 项通过。新增 `ThinkTagSplitterTest`（6 项，含跨分片标签、流末残缺标签、答案内字面量 `<think>`）；`OpenAiCompatibleClientTest` 8 → 13 项（SSE 思维链分流、内联 `<think>`、流式规划决策跨帧重组、网关拒绝私有字段后回退）；`IterativeRetrievalTest` 9 → 11 项（规划播报、失败命名）；`AskPanelTest` 2 → 3 项（思考区收起且不进入正文与 transcript）。
+
+一条既有断言 `"stream":false` 被改为 `"stream":true`：它断言的正是本节推翻的前提。
+
+`ArchitectureTest` 10/10 保持，未放宽任何依赖规则。
+
+远端行为只能在真实网关上确认，判据是诊断报告里 `retrieval-plan` 事件的 `outcome=ok` 且单轮出现多条；`thinking-switch-rejected` 表示网关不接受私有字段并已回退，`stream-deadline` 表示流式读取仍触顶。
+
+### 25.7 已知遗留
+
+`KnowledgeService` 仍保留一份实现同一 `AskKnowledge` 接口的单次检索版 `askStream`（自述 "Single-shot path: one search, one send"），与 `ChatModel.planRetrieval` 默认返回 `answer()` 一样，都是"换错一行装配就整体静默失效"的暴露面。本次只做签名适配，未删除。

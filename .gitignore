@@ -90,6 +90,7 @@ __pycache__/
 /.vscode/
 /.agents/
 /.codex/
+/.claude/
 
 # Operating-system files
 .DS_Store

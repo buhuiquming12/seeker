@@ -1,5 +1,6 @@
 package com.simplerag.adapter.out.openai;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.conversation.ChatRequest;
 import com.simplerag.application.conversation.RetrievalAttempt;
@@ -32,6 +33,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.Map;
 
@@ -42,10 +44,22 @@ import java.util.Map;
 public final class OpenAiCompatibleClient implements com.simplerag.application.port.out.ChatModel {
     private static final int MAX_TRANSPORT_ATTEMPTS = 3;
     private static final Duration CHAT_TIMEOUT = Duration.ofSeconds(90);
-    private static final Duration PLANNER_TIMEOUT = Duration.ofSeconds(20);
+    /**
+     * Covers the planner's response headers and, re-applied as a read deadline, its streamed body. A
+     * reasoning model routinely spends 20–40 seconds before it emits anything, so a shorter ceiling
+     * traded truncation for a timeout without ever letting the adaptive loop reach a second search.
+     */
+    private static final Duration PLANNER_TIMEOUT = Duration.ofSeconds(60);
     private static final int PLANNER_BUDGET = 6_000;
     private static final int PLANNER_SNIPPET = 320;
-    private static final int PLANNER_MAX_TOKENS = 512;
+    /**
+     * The decision itself is tiny, but a reasoning model spends its chain of thought out of the same
+     * allowance. At 512 the thinking consumed the whole budget, the response came back with
+     * {@code finish_reason=length}, and every planning round was rejected as truncated — which
+     * silently reduced the loop to a single first-round search on exactly the models most able to
+     * plan well. max_tokens is a ceiling, not a reservation, so a short decision still bills short.
+     */
+    private static final int PLANNER_MAX_TOKENS = 4_096;
     private static final String TRUNCATED_NOTICE = "\n\n[连接中断，以上为已接收内容]";
 
     private final HttpClient httpClient;
@@ -133,10 +147,18 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
                 .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload))).build();
         JsonNode response = send(request);
         TokenUsage usage = observeUsage("chat", config, payload, response.path("usage"));
-        JsonNode content = response.path("choices").path(0).path("message").path("content");
+        JsonNode message = response.path("choices").path(0).path("message");
+        JsonNode content = message.path("content");
         String answer = content.isTextual() ? content.asText() : flattenContent(content);
+        String reasoning = extractReasoning(message);
+        // A provider that inlines its chain of thought in content rather than in a separate field
+        // would otherwise hand us "<think>…</think>answer" as the answer.
+        Split split = Split.of(answer);
+        answer = split.answer();
+        reasoning = reasoning.isBlank() ? split.reasoning() : reasoning;
         if (answer.isBlank()) throw new IOException("API 返回了空答案");
-        RagAnswer result = new RagAnswer(answer.strip(), List.copyOf(chatRequest.citations()), config.model(), usage);
+        RagAnswer result = new RagAnswer(answer.strip(), List.copyOf(chatRequest.citations()), config.model(),
+                usage, reasoning);
         recordLatency("chat", config, started, "ok");
         return result;
         } catch (IOException | InterruptedException | RuntimeException failure) {
@@ -152,17 +174,17 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
         try {
             config.validateForChat();
             if (planRequest == null) throw new IllegalArgumentException("RetrievalPlanRequest must not be null");
-            ObjectNode payload = retrievalPlanPayload(config, planRequest);
-            HttpRequest request = request(config, endpoint(config.normalizedBaseUrl(), "chat/completions"),
-                            PLANNER_TIMEOUT)
-                    .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload))).build();
-            JsonNode response = send(request);
-            TokenUsage usage = observeUsage("retrieval-plan", config, payload, response.path("usage"));
-            JsonNode choice = response.path("choices").path(0);
-            JsonNode content = choice.path("message").path("content");
-            String text = content.isTextual() ? content.asText() : flattenContent(content);
-            RetrievalDecision decision = parseRetrievalDecision(text,
-                    choice.path("finish_reason").asText("")).withUsage(usage);
+            PlanAttempt attempt;
+            try {
+                attempt = requestPlan(config, planRequest, true);
+            } catch (IOException rejected) {
+                // The thinking switches are vendor extensions; a strict relay answers 4xx instead of
+                // ignoring them. Losing the planning round over that would be worse than thinking.
+                recordPlannerRejection("thinking-switch-rejected", String.valueOf(rejected.getMessage()));
+                attempt = requestPlan(config, planRequest, false);
+                if (attempt.truncated()) attempt = retryWithoutThinking(config, planRequest, attempt);
+            }
+            RetrievalDecision decision = attempt.decision();
             recordLatency("retrieval-plan", config, started,
                     decision.plannerUnavailable() ? "unusable-decision" : "ok");
             return decision;
@@ -173,12 +195,142 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
     }
 
     /**
-     * Streams the answer token by token via server-sent events, invoking {@code onDelta} for each
-     * incremental chunk of text. Falls back to the non-streaming {@link #answer} call when the server
-     * does not honour SSE, so callers always receive a complete {@link RagAnswer}.
+     * Last try after a decision truncated by the model's own thinking, asking the provider to skip it
+     * so the whole allowance goes to the JSON. Only reachable on endpoints that rejected the switches
+     * up front, so a failure here means we are out of options and keep the truncated verdict.
+     */
+    private PlanAttempt retryWithoutThinking(ApiConfig config, RetrievalPlanRequest planRequest,
+                                             PlanAttempt truncated) throws InterruptedException {
+        recordPlannerRejection("truncated-retry", "length");
+        try {
+            PlanAttempt retried = requestPlan(config, planRequest, true);
+            if (retried.truncated()) recordPlannerRejection("truncated-after-retry", "length");
+            // Both rounds were billed, so both must be reported.
+            return retried.withUsage(truncated.decision().usage().plus(retried.decision().usage()));
+        } catch (IOException retryFailed) {
+            recordPlannerRejection("retry-unreachable", String.valueOf(retryFailed.getMessage()));
+            return truncated;
+        }
+    }
+
+    /**
+     * Runs one planning round.
+     *
+     * <p>Streamed, even though nothing consumes the increments. {@link HttpRequest#timeout} bounds the
+     * whole exchange for a buffered response, so a reasoning model that deliberates for a minute made
+     * the planner fail on the clock no matter how large its token allowance was; with a streamed body
+     * the timeout only covers the response headers. {@link #PLANNER_TIMEOUT} is re-applied below as a
+     * read deadline so bypassing the request timeout cannot turn into an unbounded hang.
+     */
+    private PlanAttempt requestPlan(ApiConfig config, RetrievalPlanRequest planRequest, boolean suppressThinking)
+            throws IOException, InterruptedException {
+        ObjectNode payload = retrievalPlanPayload(config, planRequest, suppressThinking);
+        HttpRequest request = request(config, endpoint(config.normalizedBaseUrl(), "chat/completions"),
+                        PLANNER_TIMEOUT)
+                .header("Accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload))).build();
+        HttpResponse<InputStream> response = sendWithRetry(request, HttpResponse.BodyHandlers.ofInputStream());
+        PlannerResponse planner = readPlannerResponse(response);
+        TokenUsage usage = observeUsage("retrieval-plan", config, payload, planner.usage());
+        // Thinking arrives either in its own field or inlined in content; either way it must not reach
+        // the JSON parser, which would see prose wrapped around the object it is looking for.
+        Split split = Split.of(planner.content());
+        String reasoning = planner.reasoning().isBlank() ? split.reasoning() : planner.reasoning();
+        RetrievalDecision decision = parseRetrievalDecision(split.answer(), planner.finishReason())
+                .withUsage(usage).withReasoning(reasoning);
+        return new PlanAttempt(decision, "length".equalsIgnoreCase(planner.finishReason()));
+    }
+
+    /**
+     * Reads a planning response in either shape. Servers that honour {@code stream:true} send SSE
+     * frames; those that quietly ignore it send one buffered JSON object, and both have to work
+     * because "OpenAI-compatible" does not guarantee either.
+     */
+    private PlannerResponse readPlannerResponse(HttpResponse<InputStream> response)
+            throws IOException, InterruptedException {
+        StringBuilder content = new StringBuilder();
+        StringBuilder reasoning = new StringBuilder();
+        StringBuilder raw = new StringBuilder();
+        String finishReason = "";
+        TokenUsage usage = TokenUsage.UNKNOWN;
+        boolean streamed = false;
+        long deadline = System.nanoTime() + PLANNER_TIMEOUT.toNanos();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("已取消问答");
+                }
+                if (System.nanoTime() > deadline) {
+                    recordPlannerRejection("stream-deadline", finishReason);
+                    break;
+                }
+                if (!line.startsWith("data:")) {
+                    raw.append(line).append('\n');
+                    continue;
+                }
+                String data = line.substring(5).strip();
+                if (data.isEmpty()) continue;
+                if ("[DONE]".equals(data)) break;
+                JsonNode frame = readFrame(data);
+                if (frame == null) continue;
+                TokenUsage frameUsage = parseUsage(frame.path("usage"));
+                if (frameUsage.known()) usage = frameUsage;
+                JsonNode choices = frame.path("choices");
+                if (!choices.isArray() || choices.isEmpty()) continue;
+                streamed = true;
+                JsonNode choice = choices.path(0);
+                content.append(extractDelta(choice));
+                reasoning.append(extractReasoning(choice.path("delta")));
+                String reason = choice.path("finish_reason").asText("");
+                if (!reason.isBlank()) finishReason = reason;
+            }
+        }
+        if (streamed) {
+            return new PlannerResponse(content.toString(), reasoning.toString(), finishReason, usage);
+        }
+        return bufferedPlannerResponse(raw.toString(), response.statusCode());
+    }
+
+    /** The non-streaming shape: one JSON object, which may also be an error the caller must see. */
+    private PlannerResponse bufferedPlannerResponse(String body, int statusCode) throws IOException {
+        JsonNode parsed;
+        try {
+            parsed = json.readTree(body.isBlank() ? "{}" : body);
+        } catch (IOException invalidJson) {
+            throw new IOException("API 返回的不是有效 JSON（HTTP " + statusCode + "）", invalidJson);
+        }
+        if (statusCode < 200 || statusCode >= 300) {
+            String message = parsed.path("error").path("message").asText("");
+            if (message.isBlank()) message = parsed.path("message").asText("HTTP " + statusCode);
+            throw new IOException("API 请求失败：" + message);
+        }
+        JsonNode choice = parsed.path("choices").path(0);
+        JsonNode message = choice.path("message");
+        JsonNode content = message.path("content");
+        return new PlannerResponse(content.isTextual() ? content.asText() : flattenContent(content),
+                extractReasoning(message), choice.path("finish_reason").asText(""),
+                parseUsage(parsed.path("usage")));
+    }
+
+    /** What one planning round returned, normalised across the streamed and buffered shapes. */
+    private record PlannerResponse(String content, String reasoning, String finishReason, TokenUsage usage) { }
+
+    /** One planning round trip: the decision it produced, and whether the provider cut it short. */
+    private record PlanAttempt(RetrievalDecision decision, boolean truncated) {
+        PlanAttempt withUsage(TokenUsage total) {
+            return new PlanAttempt(decision.withUsage(total), truncated);
+        }
+    }
+
+    /**
+     * Streams the answer via server-sent events, invoking {@code onDelta} for each incremental piece
+     * tagged as thinking or answer. Falls back to the non-streaming {@link #answer} call when the
+     * server does not honour SSE, or when the stream carried thinking but never produced an answer.
      */
     @Override
-    public RagAnswer answerStream(ApiConfig config, ChatRequest chatRequest, Consumer<String> onDelta)
+    public RagAnswer answerStream(ApiConfig config, ChatRequest chatRequest, Consumer<AnswerDelta> onDelta)
             throws IOException, InterruptedException {
         long started = System.nanoTime();
         try {
@@ -196,9 +348,21 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
             return fallback;
         }
         StringBuilder full = new StringBuilder();
-        boolean streamed = false;
+        StringBuilder thinking = new StringBuilder();
         boolean truncated = false;
         TokenUsage streamedUsage = TokenUsage.UNKNOWN;
+        // Handles providers that inline reasoning in the content channel; providers that use a separate
+        // reasoning field never feed it, so it stays a no-op for them.
+        ThinkTagSplitter splitter = new ThinkTagSplitter();
+        BiConsumer<Boolean, String> route = (isThinking, text) -> {
+            if (isThinking) {
+                thinking.append(text);
+                if (onDelta != null) onDelta.accept(AnswerDelta.thinking(text));
+            } else {
+                full.append(text);
+                if (onDelta != null) onDelta.accept(AnswerDelta.answer(text));
+            }
+        };
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
             String line;
@@ -217,39 +381,53 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
                 if (frameUsage.known()) streamedUsage = frameUsage;
                 JsonNode choices = frame.path("choices");
                 if (!choices.isArray() || choices.isEmpty()) continue;
-                streamed = true;
-                String delta = extractDelta(choices.path(0));
-                if (!delta.isEmpty()) {
-                    full.append(delta);
-                    if (onDelta != null) onDelta.accept(delta);
+                JsonNode choice = choices.path(0);
+                // A reasoning model emits its whole chain of thought before the first answer token.
+                String reasoningDelta = extractReasoning(choice.path("delta"));
+                if (!reasoningDelta.isEmpty()) {
+                    thinking.append(reasoningDelta);
+                    if (onDelta != null) onDelta.accept(AnswerDelta.thinking(reasoningDelta));
                 }
+                splitter.accept(extractDelta(choice), route);
             }
+            splitter.flush(route);
         } catch (IOException streamFailure) {
             // The peer cut the stream. Replaying the request would duplicate the text already shown,
-            // so keep what arrived; only a stream that produced nothing is worth retrying.
+            // so keep what arrived; only a stream that produced no answer is worth retrying.
+            splitter.flush(route);
             if (full.length() == 0) {
                 recordLatency("chat-stream", config, started, "truncated-empty");
-                return answer(config, chatRequest);
+                return withReasoning(answer(config, chatRequest), thinking.toString());
             }
             truncated = true;
         }
         if (truncated) {
             full.append(TRUNCATED_NOTICE);
-            if (onDelta != null) onDelta.accept(TRUNCATED_NOTICE);
+            if (onDelta != null) onDelta.accept(AnswerDelta.answer(TRUNCATED_NOTICE));
         }
-        if (!streamed) {
-            return answer(config, chatRequest);
+        // No answer text at all — either the endpoint ignored SSE, or it streamed only thinking and
+        // stopped. Either way the turn still needs an answer, so ask again without streaming.
+        if (full.toString().isBlank()) {
+            recordLatency("chat-stream", config, started, thinking.length() > 0 ? "thinking-only" : "no-frames");
+            return withReasoning(answer(config, chatRequest), thinking.toString());
         }
-        if (full.toString().isBlank()) throw new IOException("API 返回了空答案");
         TokenUsage usage = observeUsage("chat-stream", config, payload, streamedUsage);
         RagAnswer result = new RagAnswer(full.toString().strip(), List.copyOf(chatRequest.citations()),
-                config.model(), usage);
+                config.model(), usage, thinking.toString());
         recordLatency("chat-stream", config, started, truncated ? "truncated" : "ok");
         return result;
         } catch (IOException | InterruptedException | RuntimeException failure) {
             recordLatency("chat-stream", config, started, failure.getClass().getSimpleName());
             throw failure;
         }
+    }
+
+    /** Keeps thinking already streamed to the UI when the answer itself had to be fetched again. */
+    private static RagAnswer withReasoning(RagAnswer answer, String streamedThinking) {
+        if (streamedThinking.isEmpty()) return answer;
+        String combined = answer.reasoning().isBlank() ? streamedThinking
+                : streamedThinking + "\n" + answer.reasoning();
+        return new RagAnswer(answer.text(), answer.citations(), answer.model(), answer.usage(), combined);
     }
 
     private void recordLatency(String operation, ApiConfig config, long started, String outcome) {
@@ -293,17 +471,23 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
         return payload;
     }
 
-    private ObjectNode retrievalPlanPayload(ApiConfig config, RetrievalPlanRequest request) {
+    private ObjectNode retrievalPlanPayload(ApiConfig config, RetrievalPlanRequest request,
+                                            boolean suppressThinking) {
         ObjectNode payload = json.createObjectNode();
         payload.put("model", config.model());
         payload.put("temperature", 0.0);
-        payload.put("stream", false);
-        // The planner emits one small JSON object, but it may carry up to three queries and one of
-        // them may be a HyDE pseudo-document worth several hundred characters. At 64 tokens a
-        // multi-query decision was cut off mid-array and rejected as truncated, which quietly reduced
-        // the loop to a single first-round search; a pseudo-document needs more headroom still.
-        // max_tokens is a ceiling, not a reservation, so a short decision still bills short.
+        payload.put("stream", true);
+        payload.putObject("stream_options").put("include_usage", true);
         payload.put("max_tokens", PLANNER_MAX_TOKENS);
+        if (suppressThinking) {
+            // Vendor extensions, sent together because no single one is universal: Qwen/DashScope and
+            // vLLM read enable_thinking, the OpenAI reasoning models read reasoning_effort. Planning
+            // emits one small JSON object, so a chain of thought here buys nothing and costs a minute
+            // of wall clock per round. Servers that know neither field ignore them; a strict one
+            // rejects the request, and the caller then retries on the plain schema.
+            payload.put("enable_thinking", false);
+            payload.put("reasoning_effort", "low");
+        }
         ArrayNode messages = payload.putArray("messages");
         messages.addObject().put("role", "system").put("content", retrievalPlannerSystemPrompt());
         for (ChatMessage prior : request.history()) {
@@ -416,6 +600,39 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
             content = choice.path("message").path("content");
         }
         return content.isTextual() ? content.asText() : "";
+    }
+
+    /**
+     * Reads a chain of thought from whichever field the provider uses. DeepSeek, Qwen, vLLM and most
+     * relays emit {@code reasoning_content}; OpenRouter emits {@code reasoning}. Works on both a
+     * streaming {@code delta} node and a non-streaming {@code message} node.
+     */
+    private static String extractReasoning(JsonNode node) {
+        if (node == null || node.isMissingNode()) return "";
+        for (String field : new String[] {"reasoning_content", "reasoning"}) {
+            JsonNode value = node.path(field);
+            if (value.isTextual()) return value.asText();
+            // Some relays wrap it the way content is wrapped, as an array of typed parts.
+            if (value.isArray()) {
+                String flattened = flattenContent(value);
+                if (!flattened.isEmpty()) return flattened;
+            }
+        }
+        return "";
+    }
+
+    /** Answer text and inline reasoning pulled apart, for the non-streaming paths. */
+    private record Split(String answer, String reasoning) {
+        static Split of(String content) {
+            StringBuilder answer = new StringBuilder();
+            StringBuilder reasoning = new StringBuilder();
+            ThinkTagSplitter splitter = new ThinkTagSplitter();
+            BiConsumer<Boolean, String> route = (isThinking, text) ->
+                    (isThinking ? reasoning : answer).append(text);
+            splitter.accept(content == null ? "" : content, route);
+            splitter.flush(route);
+            return new Split(answer.toString(), reasoning.toString());
+        }
     }
 
     private static TokenUsage parseUsage(JsonNode usage) {

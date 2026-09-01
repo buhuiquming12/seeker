@@ -57,7 +57,7 @@ class OpenAiCompatibleClientTest {
             assertEquals("AskUseCase call chain", decision.query());
             assertTrue(requestBody.get().contains("src/AskUseCase.java"));
             assertTrue(requestBody.get().contains("Previous searches"));
-            assertTrue(requestBody.get().contains("\"stream\":false"));
+            assertTrue(requestBody.get().contains("\"stream\":true"));
             assertFalse(requestBody.get().contains("secret"));
         } finally {
             server.stop(0);
@@ -248,7 +248,7 @@ class OpenAiCompatibleClientTest {
             StringBuilder streamed = new StringBuilder();
 
             RagAnswer answer = new OpenAiCompatibleClient(DiagnosticSink.noop(), estimator)
-                    .answerStream(config, request, streamed::append);
+                    .answerStream(config, request, delta -> streamed.append(delta.text()));
 
             assertEquals("Use env vars [1].", streamed.toString());
             assertEquals(1234, answer.usage().promptTokens());
@@ -325,6 +325,176 @@ class OpenAiCompatibleClientTest {
         for (int read = 0; read < length; read++) {
             if (input.read() == -1) break;
         }
+    }
+
+    @Test
+    void streamedReasoningIsRoutedSeparatelyAndKeptOutOfTheAnswer() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            String sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"the docs mention \"}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"env vars\"}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":\"Use env vars [1].\"}}]}\n\n"
+                    + "data: [DONE]\n\n";
+            byte[] bytes = sse.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+        try {
+            StringBuilder answered = new StringBuilder();
+            StringBuilder thought = new StringBuilder();
+
+            RagAnswer answer = new OpenAiCompatibleClient().answerStream(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    streamRequest(), delta -> {
+                        if (delta.reasoning()) thought.append(delta.text()); else answered.append(delta.text());
+                    });
+
+            assertEquals("the docs mention env vars", thought.toString());
+            assertEquals("Use env vars [1].", answered.toString());
+            // The answer becomes conversation history and the clipboard payload; thinking must not be in it.
+            assertEquals("Use env vars [1].", answer.text());
+            assertEquals("the docs mention env vars", answer.reasoning());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void inlineThinkTagsAreSplitOutOfTheStreamedContent() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            // Ollama and LM Studio inline the chain of thought, and the tag straddles frames.
+            String sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":\"nk>checking sources</think>\"}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":\"Use env vars [1].\"}}]}\n\n"
+                    + "data: [DONE]\n\n";
+            byte[] bytes = sse.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+        try {
+            StringBuilder answered = new StringBuilder();
+
+            RagAnswer answer = new OpenAiCompatibleClient().answerStream(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    streamRequest(), delta -> {
+                        if (!delta.reasoning()) answered.append(delta.text());
+                    });
+
+            assertEquals("Use env vars [1].", answered.toString());
+            assertEquals("checking sources", answer.reasoning());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aRelayThatRejectsTheThinkingSwitchesIsRetriedOnThePlainSchema() throws Exception {
+        // enable_thinking / reasoning_effort are vendor extensions. A strict relay answers 400 rather
+        // than ignoring them, and losing the planning round over that would be worse than thinking.
+        AtomicInteger calls = new AtomicInteger();
+        AtomicReference<String> retryBody = new AtomicReference<>("");
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            if (calls.incrementAndGet() == 1) {
+                byte[] error = "{\"error\":{\"message\":\"unknown field enable_thinking\"}}"
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+                exchange.sendResponseHeaders(400, error.length);
+                exchange.getResponseBody().write(error);
+                exchange.close();
+                return;
+            }
+            retryBody.set(body);
+            respond(exchange, "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":"
+                    + "\"{\\\"action\\\":\\\"search\\\",\\\"queries\\\":[\\\"ChunkerRegistry 注册\\\"]}\"}}]}");
+        });
+        server.start();
+        try {
+            RetrievalDecision decision = new OpenAiCompatibleClient().planRetrieval(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    new RetrievalPlanRequest("kb", 1L, "q", List.of(), List.of(),
+                            List.of(new RetrievalAttempt("q", 0)), 3));
+
+            assertEquals(2, calls.get(), "the rejected request must be retried exactly once");
+            assertTrue(decision.shouldSearch(), "the retry produced a usable decision");
+            assertEquals(List.of("ChunkerRegistry 注册"), decision.queryTexts());
+            assertFalse(retryBody.get().contains("enable_thinking"),
+                    "the retry must drop the switches the relay refused");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void plannerReadsAStreamedDecisionAndItsThinking() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            String sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"evidence covers it\"}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"action\\\":\\\"ans\"}}]}\n\n"
+                    + "data: {\"choices\":[{\"delta\":{\"content\":\"wer\\\"}\"},\"finish_reason\":\"stop\"}]}\n\n"
+                    + "data: [DONE]\n\n";
+            byte[] bytes = sse.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+        try {
+            RetrievalDecision decision = new OpenAiCompatibleClient().planRetrieval(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    new RetrievalPlanRequest("kb", 1L, "q", List.of(), List.of(),
+                            List.of(new RetrievalAttempt("q", 0)), 3));
+
+            // The JSON was split across frames, so this also proves the frames are reassembled.
+            assertFalse(decision.shouldSearch());
+            assertFalse(decision.plannerUnavailable());
+            assertEquals("evidence covers it", decision.reasoning());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void plannerRequestsAreStreamedAndSkipThinkingByDefault() throws Exception {
+        AtomicReference<String> requestBody = new AtomicReference<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            requestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            respond(exchange, "{\"choices\":[{\"message\":{\"content\":\"{\\\"action\\\":\\\"answer\\\"}\"}}]}");
+        });
+        server.start();
+        try {
+            new OpenAiCompatibleClient().planRetrieval(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    new RetrievalPlanRequest("kb", 1L, "q", List.of(), List.of(),
+                            List.of(new RetrievalAttempt("q", 0)), 3));
+
+            assertTrue(requestBody.get().contains("\"max_tokens\":4096"),
+                    "512 tokens was consumed by the chain of thought before any JSON was emitted");
+            // A buffered response makes the request timeout cover the model's whole deliberation, which
+            // is what turned the budget fix into a 60-second timeout instead of a working planner.
+            assertTrue(requestBody.get().contains("\"stream\":true"), "planning must not be buffered");
+            assertTrue(requestBody.get().contains("\"enable_thinking\":false"),
+                    "planning emits one small JSON object; thinking here only costs wall clock");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    private static ChatRequest streamRequest() {
+        DocumentChunk chunk = new DocumentChunk("c1", "docs/db.md", "docs", "db.md", ".md",
+                1, 3, "credentials belong in environment variables", 1L, null);
+        return new ChatRequest("kb", 1L, "where do credentials go?", List.of(),
+                List.of(new RagCitation(1, chunk, 0.9)));
     }
 
     private static void respond(HttpExchange exchange, String body) throws IOException {

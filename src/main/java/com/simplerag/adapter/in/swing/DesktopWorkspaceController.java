@@ -1,5 +1,6 @@
 package com.simplerag.adapter.in.swing;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.dto.AskResultView;
 import com.simplerag.application.dto.CitationView;
 import com.simplerag.application.dto.DocumentReference;
@@ -314,15 +315,15 @@ public final class DesktopWorkspaceController {
         // Bind UI session to knowledgeBaseId + sourceRevision; store replaces session on revision change.
         ask.sessionFor(identity);
         askPanel.beginTurn(question);
-        askTask = tasks.<AskResultView, String>submit(identity, knowledge::identity, publish ->
+        askTask = tasks.<AskResultView, AnswerDelta>submit(identity, knowledge::identity, publish ->
                 ask.ask(identity, question, config,
                         citations -> { if (isCurrentIdentity(identity)) publishCitations(citations); },
                         this::authorizeRemoteSend,
                         delta -> { if (isCurrentIdentity(identity)) publish.accept(delta); }), chunks -> {
-                    for (String chunk : chunks) askPanel.appendAssistantDelta(chunk);
+                    for (AnswerDelta chunk : chunks) askPanel.appendAssistantDelta(chunk);
                 }, answer -> {
                     askPanel.asking(false);
-                    askPanel.finishAssistant(answer.text(), answer.model());
+                    askPanel.finishAssistant(answer.text(), answer.model(), answer.reasoning());
                     askPanel.conversationMeta("多轮上下文与 AI 自主检索已启用 · 本轮 " + tokenSummary(answer.usage()));
                     flashStatus("问答完成，引用 " + answer.citations().size() + " 个片段 · " + tokenSummary(answer.usage()));
                 }, failure -> {

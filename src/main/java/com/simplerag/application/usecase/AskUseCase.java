@@ -1,5 +1,6 @@
 package com.simplerag.application.usecase;
 
+import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.conversation.ChatRequest;
 import com.simplerag.application.dto.AskResultView;
@@ -66,7 +67,7 @@ public final class AskUseCase implements AskKnowledge {
     public AskResultView askStream(String knowledgeBaseId, long expectedRevision, String question,
                                    List<ChatMessage> history, ApiConfig config,
                                    Consumer<List<CitationView>> onCitations, RemoteSendAuthorizer authorizer,
-                                   Consumer<String> onDelta)
+                                   Consumer<AnswerDelta> onDelta)
             throws IOException, InterruptedException {
         IndexHandle handle = requireReady(knowledgeBaseId, expectedRevision);
         KnowledgeBase knowledgeBase = knowledgeBases.findKnowledgeBase(knowledgeBaseId).orElseThrow();
@@ -83,25 +84,38 @@ public final class AskUseCase implements AskKnowledge {
         // every scope change blocked the worker thread between remote calls, which let the pooled TLS
         // connection go stale mid-turn.
         AtomicBoolean authorized = new AtomicBoolean();
+        // Retrieval planning is part of the turn's chain of thought, so it accumulates alongside the
+        // answer thinking and is reported as one body of reasoning.
+        StringBuilder reasoning = new StringBuilder();
+        Consumer<AnswerDelta> relay = delta -> {
+            if (delta.reasoning()) reasoning.append(delta.text());
+            if (onDelta != null) onDelta.accept(delta);
+        };
         IterativeRetrieval.Result retrieved = retrieval.collect(handle.knowledgeBaseId(), handle.sourceRevision(),
                 question, safeHistory, config,
                 (query, strategy) -> retrieveContext(handle, query, strategy),
                 scope -> publishScope(knowledgeBase, expectedRevision, config, scope,
                         onCitations, authorizer, authorized),
                 () -> freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision()),
-                handle.engine().semanticEnabled());
+                handle.engine().semanticEnabled(), relay);
         List<RagCitation> citations = retrieved.citations();
 
         freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision());
         // Retrieval found nothing. Calling the model anyway would send a question with no evidence and
         // fail inside the adapter, surfacing a raw argument error instead of an honest abstention.
         if (citations.isEmpty()) {
-            return abstain(knowledgeBaseId, expectedRevision, retrieved, onDelta);
+            return abstain(knowledgeBaseId, expectedRevision, retrieved, onDelta, reasoning.toString());
         }
         List<CitationView> views = citations.stream().map(AskUseCase::toView).toList();
         ChatRequest request = new ChatRequest(handle.knowledgeBaseId(), handle.sourceRevision(),
                 question, safeHistory, citations);
-        RagAnswer answer = chat.answerStream(config, request, onDelta);
+        int streamedReasoning = reasoning.length();
+        RagAnswer answer = chat.answerStream(config, request, relay);
+        // The non-streaming fallback inside the adapter returns its thinking on the answer instead of
+        // emitting it as deltas, so nothing streamed means nothing was relayed — take it from there.
+        if (reasoning.length() == streamedReasoning && !answer.reasoning().isBlank()) {
+            reasoning.append(answer.reasoning());
+        }
         // One turn bills several calls: every planning round plus the answer itself.
         TokenUsage turnUsage = retrieved.usage().plus(answer.usage());
         diagnostics.record("turn token usage", "remote-api", "ask",
@@ -109,7 +123,7 @@ public final class AskUseCase implements AskKnowledge {
                         "promptTokens", Integer.toString(turnUsage.promptTokens()),
                         "completionTokens", Integer.toString(turnUsage.completionTokens()),
                         "totalTokens", Integer.toString(turnUsage.totalTokens())));
-        return new AskResultView(answer.text(), views, answer.model(), turnUsage);
+        return new AskResultView(answer.text(), views, answer.model(), turnUsage, reasoning.toString());
     }
 
     /**
@@ -137,7 +151,7 @@ public final class AskUseCase implements AskKnowledge {
      * rephrase the question, versus check the chat API configuration.
      */
     private AskResultView abstain(String knowledgeBaseId, long revision, IterativeRetrieval.Result retrieved,
-                                  Consumer<String> onDelta) {
+                                  Consumer<AnswerDelta> onDelta, String reasoning) {
         String message = retrieved.plannerUnavailable()
                 ? "当前知识库中没有检索到相关内容，且自动检索规划不可用（远程模型未响应或返回了无法解析的结果），"
                         + "因此没有尝试改写检索词。请检查对话模型配置，或换用更具体的关键词重新提问。"
@@ -146,8 +160,8 @@ public final class AskUseCase implements AskKnowledge {
         diagnostics.record("RAG abstained", "retrieval", "no citations",
                 Map.of("knowledgeBaseId", knowledgeBaseId, "revision", Long.toString(revision),
                         "plannerUnavailable", Boolean.toString(retrieved.plannerUnavailable())));
-        if (onDelta != null) onDelta.accept(message);
-        return new AskResultView(message, List.of(), null, retrieved.usage());
+        if (onDelta != null) onDelta.accept(AnswerDelta.answer(message));
+        return new AskResultView(message, List.of(), null, retrieved.usage(), reasoning);
     }
 
     private boolean localOnly(String knowledgeBaseId) {
