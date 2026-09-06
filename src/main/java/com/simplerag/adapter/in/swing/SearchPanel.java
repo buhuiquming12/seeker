@@ -34,6 +34,8 @@ import java.awt.Graphics;
 import java.awt.Insets;
 import java.awt.event.ActionEvent;
 import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -53,12 +55,13 @@ public final class SearchPanel extends JPanel {
     private final JTextArea lineNumbers = new JTextArea();
     private final JLabel previewTitle = new JLabel("选择一个结果");
     private final JLabel previewMeta = new JLabel(" ");
-    private final JButton open = new JButton("打开");
+    private final JButton open = new JButton("系统打开");
     private final JButton locate = new JButton("目录");
     private final JButton copy = new JButton("复制");
+    private final JButton openInApp = new JButton("应用内打开");
 
     public SearchPanel(Runnable onQueryChanged, Consumer<SearchResultView> onSelection,
-                       Runnable onOpen, Runnable onLocate, Runnable onCopy) {
+                       Runnable onOpen, Runnable onLocate, Runnable onCopy, Runnable onOpenInApp) {
         super(new BorderLayout());
         Theme.opaque(this, Theme.BACKGROUND);
         add(buildToolbar(), BorderLayout.NORTH);
@@ -76,7 +79,14 @@ public final class SearchPanel extends JPanel {
             @Override public void actionPerformed(ActionEvent event) { if (!query.getText().isEmpty()) query.setText(""); }
         });
         resultList.addListSelectionListener(event -> { if (!event.getValueIsAdjusting()) onSelection.accept(resultList.getSelectedValue()); });
+        // Same gesture as the explorer tree: double click stays inside the application.
+        resultList.addMouseListener(new MouseAdapter() {
+            @Override public void mouseClicked(MouseEvent event) {
+                if (event.getClickCount() == 2 && resultList.getSelectedValue() != null) onOpenInApp.run();
+            }
+        });
         open.addActionListener(event -> onOpen.run()); locate.addActionListener(event -> onLocate.run()); copy.addActionListener(event -> onCopy.run());
+        openInApp.addActionListener(event -> onOpenInApp.run());
     }
 
     public String query() { return query.getText().strip(); }
@@ -98,6 +108,7 @@ public final class SearchPanel extends JPanel {
 
     public void preview(SearchResultView result) {
         boolean present = result != null; open.setEnabled(present); locate.setEnabled(present); copy.setEnabled(present);
+        openInApp.setEnabled(present);
         preview.getHighlighter().removeAllHighlights();
         if (!present) { previewTitle.setText("选择一个结果"); previewMeta.setText(" "); preview.setText(""); lineNumbers.setText(""); return; }
         DocumentReference document = result.document(); previewTitle.setText(document.fileName()); previewTitle.setToolTipText(document.path().toString());
@@ -144,7 +155,10 @@ public final class SearchPanel extends JPanel {
     private JPanel buildPreview() { JPanel panel = new JPanel(new BorderLayout(0, 12)); Theme.opaque(panel, Theme.PANEL_ALT); panel.setBorder(Theme.padding(15, 16, 12, 16));
         JPanel titlePanel = new JPanel(new BorderLayout(12, 4)); titlePanel.setOpaque(false); JPanel labels = new JPanel(); labels.setOpaque(false); labels.setLayout(new BoxLayout(labels, BoxLayout.Y_AXIS));
         previewTitle.setForeground(Theme.TEXT); previewTitle.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 15f)); previewMeta.setForeground(Theme.MUTED); previewMeta.setFont(Theme.UI_FONT.deriveFont(10f)); labels.add(previewTitle); labels.add(Box.createVerticalStrut(3)); labels.add(previewMeta);
-        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0)); actions.setOpaque(false); for (JButton button : List.of(copy, locate, open)) { Theme.styleButton(button, button == open); button.setMargin(new Insets(6, 10, 6, 10)); actions.add(button); }
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0)); actions.setOpaque(false); for (JButton button : List.of(copy, locate, open, openInApp)) { Theme.styleButton(button, button == openInApp); button.setMargin(new Insets(6, 10, 6, 10)); actions.add(button); }
+        copy.setToolTipText("复制该片段的正文"); locate.setToolTipText("在文件资源管理器中打开所在目录");
+        open.setToolTipText("用系统默认程序打开该文件");
+        openInApp.setToolTipText("在应用内的文件页打开，并定位到这个片段（双击结果同样生效）");
         titlePanel.add(labels, BorderLayout.CENTER); titlePanel.add(actions, BorderLayout.EAST); preview.setEditable(false); preview.setFont(Theme.MONO_FONT); preview.setBackground(Theme.PANEL_ALT); preview.setForeground(new Color(218, 226, 230)); preview.setCaretColor(Theme.ACCENT); preview.setTabSize(4); preview.setBorder(Theme.padding(10, 10, 10, 10));
         lineNumbers.setEditable(false); lineNumbers.setFont(Theme.MONO_FONT); lineNumbers.setBackground(Theme.PANEL); lineNumbers.setForeground(new Color(104, 116, 124)); lineNumbers.setBorder(Theme.padding(10, 8, 10, 8)); lineNumbers.setFocusable(false);
         JScrollPane scroll = scroll(preview); scroll.setRowHeaderView(lineNumbers); scroll.setBorder(BorderFactory.createLineBorder(Theme.BORDER)); panel.add(titlePanel, BorderLayout.NORTH); panel.add(scroll, BorderLayout.CENTER); return panel; }

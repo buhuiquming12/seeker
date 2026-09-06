@@ -1,5 +1,6 @@
 package com.simplerag.adapter.in.swing;
 
+import com.simplerag.application.dto.DocumentReference;
 import com.simplerag.application.dto.FileContentView;
 import com.simplerag.application.dto.FileIndexState;
 import com.simplerag.application.dto.FileNodeView;
@@ -12,11 +13,17 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
+import javax.swing.SwingUtilities;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultHighlighter;
+import javax.swing.text.Highlighter;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Insets;
+import java.awt.Rectangle;
+import java.awt.geom.Rectangle2D;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.function.Consumer;
@@ -29,6 +36,9 @@ import java.util.function.Consumer;
  * retrieval can actually cite instead of raw bytes.
  */
 public final class FileViewerPanel extends JPanel {
+    /** Same green the search page paints semantic hits with, so "located" reads the same everywhere. */
+    private static final Color FOCUS = new Color(38, 104, 83);
+
     private final JLabel title = new JLabel("选择一个文件");
     private final JLabel location = new JLabel(" ");
     private final JLabel state = new JLabel(" ");
@@ -55,6 +65,21 @@ public final class FileViewerPanel extends JPanel {
 
     public FileNodeView selected() { return current; }
 
+    /**
+     * Package-private views for panel tests; the workspace controller drives this page through its
+     * public methods only.
+     */
+    String metaText() { return meta.getText(); }
+
+    String bodyText() { return body.getText(); }
+
+    /** Offsets of the located citation, or {@code null} when nothing is highlighted. */
+    int[] focusRange() {
+        Highlighter.Highlight[] highlights = body.getHighlighter().getHighlights();
+        return highlights.length == 0 ? null
+                : new int[]{highlights[0].getStartOffset(), highlights[0].getEndOffset()};
+    }
+
     public void empty() {
         current = null;
         buttons(false);
@@ -72,7 +97,23 @@ public final class FileViewerPanel extends JPanel {
         setBody("正在读取文件内容…", List.of());
     }
 
+    /** Header for a file reached from a citation or search hit, before its index state is known. */
+    public void loading(Path path) {
+        header(path, "正在读取索引状态…");
+        setBody("正在读取文件内容…", List.of());
+    }
+
     public void show(FileNodeView node, FileContentView content) {
+        show(node, content, null);
+    }
+
+    /**
+     * @param focus the cited chunk to put on screen, or {@code null} for a plain preview. The chunk
+     *              text is matched verbatim because the same readers feed both the index and this
+     *              page, so a miss means the file changed after indexing — which the page reports
+     *              instead of silently scrolling somewhere plausible.
+     */
+    public void show(FileNodeView node, FileContentView content, DocumentReference focus) {
         header(node);
         if (content.text().isEmpty()) {
             setBody(content.notice().isEmpty() ? "该文件没有可显示的文本" : content.notice(), List.of());
@@ -80,10 +121,16 @@ public final class FileViewerPanel extends JPanel {
         }
         setBody(content.text(), content.lineLabels());
         if (!content.notice().isEmpty()) meta.setText(meta.getText() + "  ·  " + content.notice());
+        if (focus != null) locate(content, focus);
     }
 
     public void failed(FileNodeView node, String message) {
         header(node);
+        setBody("无法读取该文件：" + message, List.of());
+    }
+
+    public void failed(Path path, String message) {
+        header(path, " ");
         setBody("无法读取该文件：" + message, List.of());
     }
 
@@ -109,6 +156,75 @@ public final class FileViewerPanel extends JPanel {
         meta.setText(metaLine(node));
     }
 
+    private void header(Path path, String metaText) {
+        current = null;
+        buttons(false);
+        title.setText(fileName(path));
+        title.setToolTipText(path.toString());
+        location.setText(path.toString());
+        state.setText(" ");
+        state.setIcon(null);
+        meta.setText(metaText);
+    }
+
+    /** Highlights the cited chunk and scrolls it into view, or says why it could not be found. */
+    private void locate(FileContentView content, DocumentReference focus) {
+        int[] range = range(content, focus);
+        if (range == null) {
+            meta.setText(meta.getText() + "  ·  未能定位引用 " + focus.sourceLocation()
+                    + "（文件内容可能已在索引后改动）");
+            return;
+        }
+        try {
+            body.getHighlighter().addHighlight(range[0], range[1],
+                    new DefaultHighlighter.DefaultHighlightPainter(FOCUS));
+        } catch (BadLocationException unusable) {
+            return;
+        }
+        meta.setText(meta.getText() + "  ·  已定位引用 " + focus.sourceLocation());
+        body.setCaretPosition(range[0]);
+        SwingUtilities.invokeLater(() -> scrollTo(range[0]));
+    }
+
+    /** Verbatim chunk text first; the reader's own line labels are the fallback. */
+    private static int[] range(FileContentView content, DocumentReference focus) {
+        String chunk = focus.content() == null ? "" : focus.content().strip();
+        if (!chunk.isEmpty()) {
+            int offset = content.text().indexOf(chunk);
+            if (offset >= 0) return new int[]{offset, offset + chunk.length()};
+        }
+        return labelRange(content, focus);
+    }
+
+    private static int[] labelRange(FileContentView content, DocumentReference focus) {
+        List<String> labels = content.lineLabels();
+        int first = labels.indexOf(Integer.toString(focus.startLine()));
+        if (first < 0) return null;
+        int last = Math.max(first, labels.lastIndexOf(Integer.toString(focus.endLine())));
+        String[] lines = content.text().split("\n", -1);
+        int start = 0;
+        for (int index = 0; index < first && index < lines.length; index++) start += lines[index].length() + 1;
+        int end = start;
+        for (int index = first; index <= last && index < lines.length; index++) end += lines[index].length() + 1;
+        return new int[]{start, Math.min(content.text().length(), Math.max(start, end - 1))};
+    }
+
+    private void scrollTo(int offset) {
+        try {
+            Rectangle2D view = body.modelToView2D(offset);
+            if (view == null) return;
+            int top = (int) Math.max(0, view.getY() - 60);
+            body.scrollRectToVisible(new Rectangle(0, top, 1, (int) view.getHeight() + 140));
+        } catch (BadLocationException ignored) {
+            // Nothing to scroll to; the highlight is already in place.
+        }
+    }
+
+    private static String fileName(Path path) {
+        Path name = path.getFileName();
+        return name == null ? path.toString() : name.toString();
+    }
+
     private static String metaLine(FileNodeView node) {
         StringBuilder line = new StringBuilder();
         if (node.directory()) {
@@ -130,6 +246,7 @@ public final class FileViewerPanel extends JPanel {
     }
 
     private void setBody(String text, List<String> labels) {
+        body.getHighlighter().removeAllHighlights();
         body.setText(text);
         body.setCaretPosition(0);
         int width = labels.stream().mapToInt(String::length).max().orElse(0);

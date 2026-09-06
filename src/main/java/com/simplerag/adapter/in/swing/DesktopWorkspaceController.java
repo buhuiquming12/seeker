@@ -66,6 +66,8 @@ public final class DesktopWorkspaceController {
     private BackgroundTaskCoordinator.TaskHandle highlightTask;
     private BackgroundTaskCoordinator.TaskHandle askTask;
     private BackgroundTaskCoordinator.TaskHandle previewTask;
+    /** Identity the bubbles on screen were produced under; drives the context-break marker. */
+    private KnowledgeController.TaskIdentity conversationIdentity;
 
     public DesktopWorkspaceController(KnowledgeController knowledge, SearchController search, AskController ask,
                                       FileBrowserController browser, BackgroundTaskCoordinator tasks,
@@ -80,11 +82,11 @@ public final class DesktopWorkspaceController {
         this.activeKnowledgeChanged = activeKnowledgeChanged;
         this.showFilePage = showFilePage;
         this.askPanel = new AskPanel(this::askQuestion, this::saveLocalPolicy,
-                button -> fetchModels(SettingsPanel.ModelKind.CHAT, button),
                 this::openCitation, this::clearConversation);
         this.settingsPanel = new SettingsPanel(this::saveApiSettings, this::fetchModels);
         this.searchPanel = new SearchPanel(this::scheduleSearch, this::setPreview,
-                this::openSelectedFile, this::openSelectedDirectory, this::copySelectedChunk);
+                this::openSelectedFile, this::openSelectedDirectory, this::copySelectedChunk,
+                this::openSelectedResultInApp);
         this.explorerPanel = new FileExplorerPanel(new ExplorerLoader(), new ExplorerActions(),
                 this::previewFileNode);
         this.viewerPanel = new FileViewerPanel(this::openFile, this::openFile, this::copyPath);
@@ -99,7 +101,6 @@ public final class DesktopWorkspaceController {
         freshnessTimer.setCoalesce(true);
         freshnessTimer.start();
         installQuestionShortcut();
-        askPanel.config(ask.config());
         settingsPanel.configs(ask.config(), ask.embeddingConfig(), ask.rerankConfig());
         refreshAll();
         setPreview(null);
@@ -143,6 +144,8 @@ public final class DesktopWorkspaceController {
         if (current != null) {
             activeKnowledgeChanged.accept(current);
             askPanel.localOnly(ask.localOnly(current.id()));
+            // The switch is per knowledge base, so a confirmation from the previous one must not linger.
+            askPanel.policyStatus("", Theme.MUTED);
         }
     }
     private void refreshSourcesAndStats() {
@@ -159,7 +162,26 @@ public final class DesktopWorkspaceController {
             statusBar.semantic(knowledge.semanticStatus(), knowledge.semanticEnabled());
             KnowledgeBase current = knowledge.current();
             statusBar.freshness(knowledge.freshnessStatus(), current != null && !current.freshnessReason().isBlank());
+            // A marker appended mid-answer would land under the streaming bubble, so a turn in
+            // flight keeps its identity; askQuestion() inserts the marker before the next turn.
+            if (askTask == null || askTask.isDone()) noteContextBreak(knowledge.identity());
         } catch (RuntimeException ignored) { }
+    }
+
+    /**
+     * Conversation sessions are keyed by knowledgeBaseId + sourceRevision, so a source change makes
+     * the store hand out a fresh session while the bubbles already on screen stay. The transcript
+     * says where the model's memory restarted instead of presenting both halves as one context.
+     */
+    private void noteContextBreak(KnowledgeController.TaskIdentity identity) {
+        if (identity == null) return;
+        KnowledgeController.TaskIdentity previous = conversationIdentity;
+        conversationIdentity = identity;
+        if (previous == null || previous.equals(identity)) return;
+        // A knowledge-base switch reloads the transcript from that base's own session instead.
+        if (!previous.knowledgeBaseId().equals(identity.knowledgeBaseId())) return;
+        askPanel.contextBreak("源文件已变化（revision " + identity.sourceRevision()
+                + "）· 模型从这里开始新的上下文，不再记得上面的对话");
     }
 
     private void createKnowledgeBase() {
@@ -254,8 +276,15 @@ public final class DesktopWorkspaceController {
         try {
             KnowledgeBase current = knowledge.current();
             if (current != null) ask.saveLocalOnly(current.id(), askPanel.localOnly());
-            askPanel.apiStatus("本知识库的远程发送策略已保存", Theme.ACCENT);
-        } catch (RuntimeException failure) { showError("无法保存发送策略", failure); }
+            String message = askPanel.localOnly()
+                    ? "已保存：本知识库只做本地检索，不会发送到远程模型"
+                    : "已保存：本知识库允许远程发送，每轮仍会先确认";
+            askPanel.policyStatus(message, Theme.ACCENT);
+            flashStatus(message);
+        } catch (RuntimeException failure) {
+            askPanel.policyStatus("保存发送策略失败", Theme.RED);
+            showError("无法保存发送策略", failure);
+        }
     }
 
     private void saveApiSettings() {
@@ -263,7 +292,6 @@ public final class DesktopWorkspaceController {
             ask.saveConfig(settingsPanel.chatConfig());
             ask.saveEmbeddingConfig(settingsPanel.embeddingConfig());
             ask.saveRerankConfig(settingsPanel.rerankConfig());
-            askPanel.config(ask.config());
             settingsPanel.configs(ask.config(), ask.embeddingConfig(), ask.rerankConfig());
             settingsPanel.status("全部 API 配置已安全保存；若切换向量模型，请重建索引", Theme.ACCENT);
         }
@@ -313,6 +341,7 @@ public final class DesktopWorkspaceController {
         askPanel.clearQuestion();
         KnowledgeController.TaskIdentity identity = knowledge.identity();
         // Bind UI session to knowledgeBaseId + sourceRevision; store replaces session on revision change.
+        noteContextBreak(identity);
         ask.sessionFor(identity);
         askPanel.beginTurn(question);
         askTask = tasks.<AskResultView, AnswerDelta>submit(identity, knowledge::identity, publish ->
@@ -389,6 +418,7 @@ public final class DesktopWorkspaceController {
         if (askTask != null && !askTask.isDone()) askTask.cancel();
         KnowledgeController.TaskIdentity identity = knowledge.identity();
         ask.clearSession(identity);
+        conversationIdentity = identity;
         askPanel.asking(false);
         askPanel.resetConversation("对话已清空", "多轮上下文已重置 · 仍绑定当前知识库版本");
         flashStatus("对话已清空");
@@ -408,6 +438,7 @@ public final class DesktopWorkspaceController {
     private void reloadConversationUi() {
         KnowledgeController.TaskIdentity identity = knowledge.identity();
         var session = ask.sessionFor(identity);
+        conversationIdentity = identity;
         if (session.isEmpty()) {
             askPanel.resetConversation("对话", "多轮上下文已启用 · 历史绑定 knowledgeBaseId + sourceRevision");
         } else {
@@ -480,7 +511,33 @@ public final class DesktopWorkspaceController {
     private boolean isCurrentIdentity(KnowledgeController.TaskIdentity identity) { return identity.equals(knowledge.identity()); }
     private void openSelectedFile() { SearchResultView selected = searchPanel.selected(); if (selected != null) openFile(selected.document().path()); }
     private void openSelectedDirectory() { SearchResultView selected = searchPanel.selected(); if (selected != null) openFile(selected.document().path().getParent()); }
-    private void openCitation() { CitationView selected = askPanel.selectedCitation(); if (selected != null) openFile(selected.document().path()); }
+    private void openSelectedResultInApp() {
+        SearchResultView selected = searchPanel.selected();
+        if (selected != null) openInApp(selected.document());
+    }
+    private void openCitation() {
+        CitationView selected = askPanel.selectedCitation();
+        if (selected != null) openInApp(selected.document());
+    }
+
+    /**
+     * Answer or search hit to source without leaving the application: the file page renders the same
+     * extracted text the index holds, so the cited chunk can be highlighted where it actually sits.
+     */
+    private void openInApp(DocumentReference document) {
+        if (previewTask != null) previewTask.cancel();
+        showFilePage.run();
+        viewerPanel.loading(document.path());
+        KnowledgeController.TaskIdentity identity = knowledge.identity();
+        previewTask = tasks.<FileBrowserController.FileOpen, Void>submit(identity, knowledge::identity,
+                ignored -> browser.open(identity, document.path()), null,
+                opened -> {
+                    viewerPanel.show(opened.node(), opened.content(), document);
+                    flashStatus("已定位 " + document.fileName() + "  ·  " + document.sourceLocation());
+                },
+                failure -> viewerPanel.failed(document.path(), failure.getMessage()), () -> { });
+    }
+
     private void openFile(Path path) { try { files.open(path); } catch (IOException failure) { showError("无法打开文件", failure); } }
     private void showIndexWarnings(IndexBuildResult report) {
         if (report.warnings().isEmpty()) return;

@@ -107,6 +107,22 @@ public final class FileExplorerUseCase implements BrowseKnowledgeFiles {
     }
 
     @Override
+    public FileNodeView describe(String knowledgeBaseId, long expectedRevision, Path file) {
+        requireIdentity(knowledgeBaseId, expectedRevision);
+        Path target = normalize(file);
+        requireInsideRoots(knowledgeBaseId, target);
+        IndexedFiles indexed = indexedFiles();
+        DocumentIndexEntry entry = indexed.entry(target);
+        // Same reading as children(): a path the snapshot still cites but the disk no longer has.
+        if (entry != null && !Files.exists(target)) {
+            return new FileNodeView(target, fileName(target), false, FileIndexState.DELETED,
+                    entry.size(), entry.modifiedAt(), entry.readerId(), entry.chunkIds().size(), 0,
+                    entry.contentHash(), false);
+        }
+        return node(target, indexed);
+    }
+
+    @Override
     public FileContentView readFile(String knowledgeBaseId, long expectedRevision, Path file)
             throws IOException {
         requireIdentity(knowledgeBaseId, expectedRevision);

@@ -27,4 +27,15 @@ public final class FileBrowserController {
     public FileContentView read(KnowledgeController.TaskIdentity identity, Path file) throws IOException {
         return files.readFile(identity.knowledgeBaseId(), identity.sourceRevision(), file);
     }
+
+    /**
+     * State and text of one file in a single background call, for pages reached from a citation or a
+     * search hit rather than from the tree.
+     */
+    public FileOpen open(KnowledgeController.TaskIdentity identity, Path file) throws IOException {
+        FileNodeView node = files.describe(identity.knowledgeBaseId(), identity.sourceRevision(), file);
+        return new FileOpen(node, files.readFile(identity.knowledgeBaseId(), identity.sourceRevision(), file));
+    }
+
+    public record FileOpen(FileNodeView node, FileContentView content) { }
 }

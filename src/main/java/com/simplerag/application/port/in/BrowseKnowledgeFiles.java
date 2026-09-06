@@ -29,6 +29,14 @@ public interface BrowseKnowledgeFiles {
             throws IOException;
 
     /**
+     * How the published index sees a single file, for callers that hold only a path — a citation or
+     * a search hit — and still need the same state the tree reports.
+     *
+     * @throws IllegalArgumentException when {@code file} lies outside every source root
+     */
+    FileNodeView describe(String knowledgeBaseId, long expectedRevision, Path file);
+
+    /**
      * Text of {@code file} as the indexing readers extract it.
      *
      * @throws IllegalArgumentException when {@code file} lies outside every source root

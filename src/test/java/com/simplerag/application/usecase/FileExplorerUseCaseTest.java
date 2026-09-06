@@ -148,12 +148,25 @@ class FileExplorerUseCaseTest {
     }
 
     @Test
+    void describesASingleFileTheSameWayTheTreeDoes() throws IOException {
+        Map<String, FileNodeView> children = byName(explorer.children(KB, REVISION, root));
+
+        assertEquals(children.get("indexed.md"), explorer.describe(KB, REVISION, root.resolve("indexed.md")));
+        assertEquals(children.get("modified.md"), explorer.describe(KB, REVISION, root.resolve("modified.md")));
+        assertEquals(children.get("fresh.md"), explorer.describe(KB, REVISION, root.resolve("fresh.md")));
+        // A citation can outlive its file: the snapshot still holds it, the disk does not.
+        assertEquals(children.get("gone.md"), explorer.describe(KB, REVISION, root.resolve("gone.md")));
+        assertEquals(FileIndexState.DELETED, explorer.describe(KB, REVISION, root.resolve("gone.md")).state());
+    }
+
+    @Test
     void refusesPathsOutsideEverySourceRoot() throws IOException {
         Path outside = Files.createDirectory(workspace.resolve("outside"));
         Path secret = write(outside.resolve("secret.md"), "不该被看到");
 
         assertThrows(IllegalArgumentException.class, () -> explorer.children(KB, REVISION, outside));
         assertThrows(IllegalArgumentException.class, () -> explorer.readFile(KB, REVISION, secret));
+        assertThrows(IllegalArgumentException.class, () -> explorer.describe(KB, REVISION, secret));
         assertThrows(IllegalArgumentException.class,
                 () -> explorer.children(KB, REVISION, root.resolve("..")));
     }
@@ -163,6 +176,8 @@ class FileExplorerUseCaseTest {
         assertThrows(StaleTaskException.class, () -> explorer.children(KB, REVISION + 1, root));
         assertThrows(StaleTaskException.class, () -> explorer.children("other-kb", REVISION, root));
         assertThrows(StaleTaskException.class, () -> explorer.rootNodes(KB, REVISION + 1));
+        assertThrows(StaleTaskException.class,
+                () -> explorer.describe(KB, REVISION + 1, root.resolve("indexed.md")));
     }
 
     private static Map<String, FileNodeView> byName(List<FileNodeView> nodes) {

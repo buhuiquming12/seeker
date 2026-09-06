@@ -17,7 +17,8 @@ class SearchPanelTest {
     void canOwnResultsAndPreviewWithoutMainFrame() throws Exception {
         AtomicReference<SearchPanel> panel = new AtomicReference<>();
         SwingUtilities.invokeAndWait(() -> {
-            SearchPanel created = new SearchPanel(() -> { }, ignored -> { }, () -> { }, () -> { }, () -> { });
+            SearchPanel created = new SearchPanel(() -> { }, ignored -> { }, () -> { }, () -> { }, () -> { },
+                    () -> { });
             created.extensions(Set.of("md"));
             DocumentReference document = new DocumentReference("id", Path.of("notes.md"), "notes.md", "md",
                     1, 2, "line one\nline two", false);

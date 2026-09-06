@@ -3,27 +3,24 @@ package com.simplerag.adapter.in.swing;
 import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
 import com.simplerag.application.dto.CitationView;
-import com.simplerag.rag.ApiConfig;
 
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
-import javax.swing.JComboBox;
 import javax.swing.JCheckBox;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JMenuItem;
 import javax.swing.JPanel;
-import javax.swing.JPasswordField;
 import javax.swing.JPopupMenu;
 import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextArea;
-import javax.swing.JTextField;
 import javax.swing.ScrollPaneConstants;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.border.EmptyBorder;
 import java.awt.BorderLayout;
@@ -35,8 +32,6 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
-import java.awt.GridBagConstraints;
-import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.RenderingHints;
 import java.awt.Toolkit;
@@ -47,21 +42,17 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 
 /** Knowledge-question page: multi-turn chat transcript + composer + citations sidebar. */
 public final class AskPanel extends JPanel {
-    private static final int BUBBLE_SIDE_GAP = 12;
     private static final int BUBBLE_INNER_PAD_X = 16;
     private static final int BUBBLE_INNER_PAD_Y = 12;
     private static final int USER_MAX_WIDTH_RATIO = 78;
     private static final int ASSISTANT_MAX_WIDTH_RATIO = 96;
 
-    private final JTextField apiUrl = new JTextField();
-    private final JPasswordField apiKey = new JPasswordField();
-    private final JComboBox<String> apiModel = new JComboBox<>();
-    private final JLabel apiStatus = new JLabel("API 未连接");
     private final JCheckBox localOnly = new JCheckBox("仅本地 RAG（禁止远程发送）");
+    private final JLabel policyStatus = new JLabel(" ");
     private final JTextArea question = new JTextArea(3, 30);
     private final JLabel conversationTitle = new JLabel("对话");
     private final JLabel conversationMeta = new JLabel("多轮上下文已启用 · 切换知识库或版本会自动清空");
@@ -74,10 +65,14 @@ public final class AskPanel extends JPanel {
     private final JPanel emptyState;
     private BubblePanel streamingAssistant;
     private final List<BubblePanel> bubbles = new ArrayList<>();
+    /** Divider marking where the model's history restarted; kept out of {@link #bubbles}. */
+    private JPanel lastBreak;
+    private String lastBreakMessage = "";
+    private final Runnable onOpenCitation;
 
-    public AskPanel(Runnable onAsk, Runnable onSave, Consumer<JButton> onFetch, Runnable onOpenCitation,
-                    Runnable onClearChat) {
+    public AskPanel(Runnable onAsk, Runnable onSave, Runnable onOpenCitation, Runnable onClearChat) {
         super(new BorderLayout());
+        this.onOpenCitation = onOpenCitation;
         Theme.opaque(this, Theme.BACKGROUND);
         transcript.setLayout(new BoxLayout(transcript, BoxLayout.Y_AXIS));
         Theme.opaque(transcript, Theme.BACKGROUND);
@@ -103,42 +98,39 @@ public final class AskPanel extends JPanel {
         });
     }
 
-    public ApiConfig config() {
-        Object model = apiModel.isEditable() ? apiModel.getEditor().getItem() : apiModel.getSelectedItem();
-        return new ApiConfig(apiUrl.getText(), new String(apiKey.getPassword()), model == null ? "" : model.toString());
-    }
-
-    public void config(ApiConfig config) {
-        apiUrl.setText(config.baseUrl());
-        apiKey.setText(config.apiKey());
-        if (!config.model().isBlank()) apiModel.addItem(config.model());
-        apiModel.setSelectedItem(config.model());
-        apiStatus.setText(config.model().isBlank()
-                ? "填写兼容 OpenAI 的 API 地址后获取模型"
-                : "已保存模型：" + config.model());
-    }
-
     public JTextArea questionArea() { return question; }
     public String question() { return question.getText().strip(); }
     public void clearQuestion() { question.setText(""); }
     public CitationView selectedCitation() { return citationList.getSelectedValue(); }
-    public Object modelEditorValue() { return apiModel.getEditor().getItem(); }
     public boolean localOnly() { return localOnly.isSelected(); }
     public void localOnly(boolean value) { localOnly.setSelected(value); }
 
-    public void models(List<String> models, Object previous) {
-        apiModel.removeAllItems();
-        models.forEach(apiModel::addItem);
-        if (previous != null && models.contains(previous.toString())) apiModel.setSelectedItem(previous);
-        else if (!models.isEmpty()) apiModel.setSelectedIndex(0);
+    /** Feedback for the per-knowledge-base remote-send policy, shown next to the switch itself. */
+    public void policyStatus(String text, Color color) {
+        policyStatus.setText(text == null || text.isBlank() ? " " : text);
+        policyStatus.setForeground(color);
     }
 
-    public void apiStatus(String text, Color color) {
-        apiStatus.setText(text);
-        apiStatus.setForeground(color);
-    }
+    String policyStatusText() { return policyStatus.getText(); }
 
     public void clearCitations() { citations.clear(); }
+
+    /**
+     * Opens the source behind a {@code [n]} marker clicked in an answer: the sidebar selection moves
+     * to that citation and the page reuses the same open action a double click there would.
+     *
+     * <p>Nothing happens when the number is not in the current turn's citations — history keeps the
+     * answer text but not its chunks, so an old marker has nothing left to point at.
+     */
+    void activateCitation(int number) {
+        for (int index = 0; index < citations.size(); index++) {
+            if (citations.get(index).number() != number) continue;
+            citationList.setSelectedIndex(index);
+            citationList.ensureIndexIsVisible(index);
+            if (onOpenCitation != null) onOpenCitation.run();
+            return;
+        }
+    }
 
     public void citations(List<CitationView> values) {
         citations.clear();
@@ -187,6 +179,19 @@ public final class AskPanel extends JPanel {
             if (!bubbles.get(index).user) return bubbles.get(index);
         }
         return null;
+    }
+
+    /** Rendered view of the most recent answer; panel tests assert on its styled document. */
+    MarkdownPane latestAnswerPane() {
+        BubblePanel bubble = lastAssistantBubble();
+        return bubble == null ? null : bubble.body;
+    }
+
+    /** Height the transcript row allows the latest answer, which a stale layout cap would shrink. */
+    int latestAnswerRowHeight() {
+        BubblePanel bubble = lastAssistantBubble();
+        return bubble == null || bubble.getParent() == null
+                ? 0 : bubble.getParent().getMaximumSize().height;
     }
 
     public void showMessages(List<ChatMessage> messages) {
@@ -293,6 +298,46 @@ public final class AskPanel extends JPanel {
         revalidateTranscript(false);
     }
 
+    /**
+     * Marks the point where the model's history restarted. Sessions are bound to
+     * knowledgeBaseId + sourceRevision, so a source change hands out a fresh session while the
+     * bubbles above stay on screen; without this row the page would claim a continuity the model
+     * does not have. Repeated calls replace the trailing marker instead of stacking dividers.
+     */
+    public void contextBreak(String message) {
+        if (bubbles.isEmpty()) return;
+        int last = transcript.getComponentCount() - 1;
+        if (lastBreak != null && last >= 0 && transcript.getComponent(last) == lastBreak) {
+            transcript.remove(lastBreak);
+        }
+        lastBreakMessage = message == null ? "" : message;
+        lastBreak = buildContextBreak(lastBreakMessage);
+        transcript.add(lastBreak);
+        conversationMeta(lastBreakMessage);
+        revalidateTranscript(true);
+    }
+
+    /** The marker currently shown, or empty when the transcript claims one continuous context. */
+    String contextBreakMessage() {
+        return lastBreak != null && lastBreak.getParent() == transcript ? lastBreakMessage : "";
+    }
+
+    private JPanel buildContextBreak(String message) {
+        JPanel row = new JPanel(new BorderLayout());
+        row.setOpaque(false);
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setBorder(BorderFactory.createCompoundBorder(new EmptyBorder(14, 2, 8, 2),
+                BorderFactory.createCompoundBorder(
+                        BorderFactory.createMatteBorder(1, 0, 0, 0, Theme.BORDER),
+                        new EmptyBorder(8, 0, 0, 0))));
+        JLabel label = new JLabel(message, SwingConstants.CENTER);
+        label.setForeground(Theme.AMBER);
+        label.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 10f));
+        row.add(label, BorderLayout.CENTER);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, row.getPreferredSize().height));
+        return row;
+    }
+
     public void asking(boolean value) {
         ask.setText(value ? "停止" : "发送");
         question.setEnabled(!value);
@@ -303,6 +348,8 @@ public final class AskPanel extends JPanel {
         transcript.removeAll();
         bubbles.clear();
         streamingAssistant = null;
+        lastBreak = null;
+        lastBreakMessage = "";
     }
 
     private void removeEmptyState() {
@@ -312,7 +359,8 @@ public final class AskPanel extends JPanel {
     }
 
     private BubblePanel addBubble(boolean user, String text, boolean streaming) {
-        BubblePanel bubble = new BubblePanel(user, text, streaming);
+        BubblePanel bubble = new BubblePanel(user, text, streaming, this::activateCitation,
+                () -> revalidateTranscript(true));
         bubbles.add(bubble);
 
         JPanel row = new JPanel();
@@ -344,6 +392,11 @@ public final class AskPanel extends JPanel {
         }
         for (Component child : transcript.getComponents()) {
             if (child instanceof JPanel row && child != emptyState) {
+                // Measuring a bubble resizes its text components and leaves them invalid, so the
+                // row's BoxLayout stops being told anything changed and would answer with the
+                // requirements it cached before the answer arrived. That cap is why an explicit
+                // invalidate has to come before the measurement.
+                row.invalidate();
                 Dimension preferred = row.getPreferredSize();
                 row.setMaximumSize(new Dimension(Integer.MAX_VALUE, preferred.height));
             }
@@ -371,55 +424,6 @@ public final class AskPanel extends JPanel {
                 bar.setValue(bar.getMaximum());
             });
         }
-    }
-
-    private JPanel buildApiPanel(Runnable onSave, Consumer<JButton> onFetch) {
-        JPanel panel = new JPanel(new GridBagLayout());
-        Theme.opaque(panel, Theme.PANEL_ALT);
-        panel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.BORDER), Theme.padding(12, 16, 12, 16)));
-        GridBagConstraints c = new GridBagConstraints();
-        c.gridy = 0;
-        c.insets = new Insets(0, 0, 0, 9);
-        c.fill = GridBagConstraints.HORIZONTAL;
-        c.gridx = 0;
-        c.weightx = 0.48;
-        panel.add(labeled("API URL", apiUrl), c);
-        c.gridx = 1;
-        c.weightx = 0.27;
-        panel.add(labeled("API Key", apiKey), c);
-        c.gridx = 2;
-        c.weightx = 0.18;
-        apiModel.setEditable(true);
-        panel.add(labeled("模型", apiModel), c);
-        c.gridx = 3;
-        c.weightx = 0;
-        c.fill = GridBagConstraints.NONE;
-        JButton fetch = button("获取模型", false);
-        fetch.addActionListener(e -> onFetch.accept(fetch));
-        panel.add(fetch, c);
-        c.gridx = 4;
-        c.insets = new Insets(0, 0, 0, 0);
-        JButton save = button("保存", true);
-        save.addActionListener(e -> onSave.run());
-        panel.add(save, c);
-        c.gridy = 1;
-        c.gridx = 0;
-        c.gridwidth = 3;
-        c.insets = new Insets(7, 2, 0, 0);
-        c.fill = GridBagConstraints.HORIZONTAL;
-        apiStatus.setForeground(Theme.MUTED);
-        apiStatus.setFont(Theme.UI_FONT.deriveFont(10f));
-        panel.add(apiStatus, c);
-        c.gridx = 3;
-        c.gridwidth = 2;
-        c.fill = GridBagConstraints.NONE;
-        c.anchor = GridBagConstraints.EAST;
-        localOnly.setOpaque(false);
-        localOnly.setForeground(Theme.MUTED);
-        localOnly.setFont(Theme.UI_FONT.deriveFont(10f));
-        panel.add(localOnly, c);
-        return panel;
     }
 
     private JPanel buildChatPanel(Runnable onAsk, Runnable onClearChat) {
@@ -467,7 +471,7 @@ public final class AskPanel extends JPanel {
         JLabel citationTitle = new JLabel("本轮引用");
         citationTitle.setForeground(Theme.TEXT);
         citationTitle.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 12f));
-        JLabel citationHint = new JLabel("双击打开文件 · 历史不保留片段");
+        JLabel citationHint = new JLabel("双击在应用内定位 · 历史不保留片段");
         citationHint.setForeground(Theme.MUTED);
         citationHint.setFont(Theme.UI_FONT.deriveFont(10f));
         JPanel citationHeader = new JPanel(new BorderLayout(6, 0));
@@ -572,23 +576,6 @@ public final class AskPanel extends JPanel {
         return shell;
     }
 
-    private static JPanel labeled(String text, Component component) {
-        JPanel panel = new JPanel(new BorderLayout(0, 4));
-        panel.setOpaque(false);
-        JLabel label = new JLabel(text);
-        label.setForeground(Theme.MUTED);
-        label.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 9f));
-        panel.add(label, BorderLayout.NORTH);
-        panel.add(component, BorderLayout.CENTER);
-        return panel;
-    }
-
-    private static JButton button(String text, boolean primary) {
-        JButton button = new JButton(text);
-        Theme.styleButton(button, primary);
-        return button;
-    }
-
     private static JScrollPane scroll(Component component) {
         JScrollPane pane = new JScrollPane(component);
         pane.setBorder(null);
@@ -605,7 +592,13 @@ public final class AskPanel extends JPanel {
         JLabel hint = new JLabel("模型配置请前往“设置”页 · 远程发送前仍会逐知识库确认");
         hint.setForeground(Theme.MUTED);
         hint.setFont(Theme.UI_FONT.deriveFont(10f));
-        panel.add(hint, BorderLayout.CENTER);
+        panel.add(hint, BorderLayout.WEST);
+        // Toggling the switch writes to the database, so the confirmation belongs next to the switch.
+        policyStatus.setForeground(Theme.MUTED);
+        policyStatus.setFont(Theme.UI_FONT.deriveFont(10f));
+        policyStatus.setHorizontalAlignment(SwingConstants.RIGHT);
+        policyStatus.setBorder(Theme.padding(0, 12, 0, 12));
+        panel.add(policyStatus, BorderLayout.CENTER);
         localOnly.setOpaque(false);
         localOnly.setForeground(Theme.MUTED);
         localOnly.setFont(Theme.UI_FONT.deriveFont(10f));
@@ -632,41 +625,42 @@ public final class AskPanel extends JPanel {
     }
 
     private static final class BubblePanel extends JPanel {
+        /** Gap BorderLayout leaves between the header block and the body. */
+        private static final int ROW_GAP = 4;
+        private static final int STREAMING_MIN_HEIGHT = 56;
+
         private final boolean user;
-        private final JTextArea body = new JTextArea();
+        private final MarkdownPane body;
         private final JLabel role = new JLabel();
+        private final JPanel header = new JPanel(new BorderLayout());
         /** Chain of thought and retrieval planning. Never part of {@link #text()}. */
         private final JTextArea thinking = new JTextArea();
         private final JButton thinkingToggle = new JButton();
-        private final JPanel thinkingSection = new JPanel(new BorderLayout(0, 4));
+        private final JPanel thinkingSection = new JPanel(new BorderLayout(0, ROW_GAP));
+        /** The message as the model wrote it: what gets copied, measured and re-rendered. */
+        private final StringBuilder raw = new StringBuilder();
         private boolean thinkingExpanded = true;
         private long thinkingStartedNanos;
         private boolean streaming;
         private boolean error;
         private int availableWidth = 720;
 
-        private BubblePanel(boolean user, String text, boolean streaming) {
-            super(new BorderLayout(0, 4));
+        private BubblePanel(boolean user, String text, boolean streaming, IntConsumer onCitation,
+                            Runnable onRendered) {
+            super(new BorderLayout(0, ROW_GAP));
             this.user = user;
             this.streaming = streaming;
+            // Questions are shown as typed; only answers carry markdown and citation markers.
+            this.body = new MarkdownPane(user ? new Color(9, 30, 25) : Theme.TEXT,
+                    user ? new Color(28, 110, 91) : Theme.ACCENT_DARK, Theme.TEXT,
+                    user ? null : onCitation, onRendered);
             setOpaque(false);
             setBorder(Theme.padding(BUBBLE_INNER_PAD_Y, BUBBLE_INNER_PAD_X, BUBBLE_INNER_PAD_Y, BUBBLE_INNER_PAD_X));
             role.setText(user ? "你" : "助手");
             role.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 10f));
             role.setForeground(user ? new Color(9, 30, 25) : Theme.ACCENT);
-            body.setEditable(false);
-            body.setLineWrap(true);
-            body.setWrapStyleWord(true);
-            body.setOpaque(false);
-            body.setFont(Theme.UI_FONT.deriveFont(13.5f));
-            body.setForeground(user ? new Color(9, 30, 25) : Theme.TEXT);
-            body.setText(text == null ? "" : text);
-            body.setBorder(null);
-            body.setFocusable(true);
-            body.setSelectionColor(user ? new Color(28, 110, 91) : Theme.ACCENT_DARK);
-            body.setSelectedTextColor(Theme.TEXT);
+            setText(text);
             installCopyMenu();
-            JPanel header = new JPanel(new BorderLayout());
             header.setOpaque(false);
             header.add(role, BorderLayout.WEST);
             JButton copy = new JButton("复制");
@@ -677,7 +671,7 @@ public final class AskPanel extends JPanel {
             copy.setFont(Theme.UI_FONT.deriveFont(9f));
             copy.setMargin(new Insets(0, 4, 0, 4));
             // Deliberately body-only: thinking is scratch work and must not land in the clipboard.
-            copy.addActionListener(event -> AskPanel.copy(body.getText()));
+            copy.addActionListener(event -> AskPanel.copy(text()));
             header.add(copy, BorderLayout.EAST);
             JPanel north = new JPanel();
             north.setOpaque(false);
@@ -758,18 +752,21 @@ public final class AskPanel extends JPanel {
         private void refreshThinkingLabel() {
             long seconds = thinkingStartedNanos == 0L ? 0L
                     : (System.nanoTime() - thinkingStartedNanos) / 1_000_000_000L;
-            thinkingToggle.setText((thinkingExpanded ? "▾ 思考过程" : "▸ 思考过程")
+            // ▲/▼ are the triangles GB2312 covers, so Microsoft YaHei UI has them; the thin ▾/▸ pair
+            // this used to draw is not in the font and came out as tofu. The arrow shows the action.
+            thinkingToggle.setText((thinkingExpanded ? "▲ 思考过程" : "▼ 思考过程")
                     + (seconds > 0 ? " · " + seconds + "s" : ""));
         }
 
-        String text() { return body.getText(); }
+        /** The message as written, not as rendered: markup belongs in the clipboard too. */
+        String text() { return raw.toString(); }
 
         private void installCopyMenu() {
             JPopupMenu menu = new JPopupMenu();
             JMenuItem selected = new JMenuItem("复制选中文本");
             JMenuItem whole = new JMenuItem("复制本条消息");
             selected.addActionListener(event -> AskPanel.copy(body.getSelectedText()));
-            whole.addActionListener(event -> AskPanel.copy(body.getText()));
+            whole.addActionListener(event -> AskPanel.copy(text()));
             menu.add(selected); menu.add(whole);
             body.addMouseListener(new MouseAdapter() {
                 private void show(MouseEvent event) {
@@ -783,28 +780,33 @@ public final class AskPanel extends JPanel {
         }
 
         void append(String delta) {
-            body.append(delta);
+            raw.append(delta);
+            body.streaming(raw.toString(), !user);
             invalidate();
         }
 
         void setText(String text) {
-            body.setText(text == null ? "" : text);
+            raw.setLength(0);
+            raw.append(text == null ? "" : text);
+            body.set(raw.toString(), !user);
             invalidate();
         }
 
         boolean isEmpty() {
-            return body.getText().isBlank();
+            return raw.toString().isBlank();
         }
 
         void setStreaming(boolean streaming) {
             this.streaming = streaming;
+            // Whatever the coalescing timer still owes is due now that the turn has settled.
+            if (!streaming) body.flush();
             repaint();
         }
 
         void markError() {
             this.error = true;
             role.setForeground(Theme.RED);
-            body.setForeground(Theme.RED);
+            body.markError();
             repaint();
         }
 
@@ -818,41 +820,35 @@ public final class AskPanel extends JPanel {
             return Math.max(200, availableWidth * ratio / 100);
         }
 
-        private int contentWidthFor(int bubbleWidth) {
-            return Math.max(80, bubbleWidth - BUBBLE_INNER_PAD_X * 2);
+        /**
+         * The one place that knows how tall this bubble is. The panel reports its own preferred size,
+         * so anything not counted here simply does not get drawn: every wrapping child is measured at
+         * the content width, everything else contributes its natural height.
+         */
+        private int heightAt(int bubbleWidth) {
+            int content = Math.max(80, bubbleWidth - BUBBLE_INNER_PAD_X * 2);
+            int height = BUBBLE_INNER_PAD_Y * 2 + header.getPreferredSize().height + ROW_GAP;
+            if (thinkingSection.isVisible()) {
+                height += thinkingToggle.getPreferredSize().height;
+                if (thinkingExpanded) height += ROW_GAP + wrappedHeight(thinking, content);
+            }
+            height += wrappedHeight(body, content);
+            return streaming ? Math.max(height, STREAMING_MIN_HEIGHT) : height;
         }
 
-        private Dimension measure(int bubbleWidth) {
-            int contentWidth = contentWidthFor(bubbleWidth);
-            body.setSize(new Dimension(contentWidth, Short.MAX_VALUE));
-            Dimension bodySize = body.getPreferredSize();
-            int height = bodySize.height + role.getPreferredSize().height + BUBBLE_INNER_PAD_Y * 2 + 8;
-            // BorderLayout would happily clip the thinking area otherwise: this panel reports its own
-            // preferred size, so anything not counted here simply does not get drawn.
-            height += thinkingHeight(contentWidth);
-            if (streaming) {
-                height = Math.max(height, 56);
-            }
-            return new Dimension(bubbleWidth, height);
-        }
-
-        private int thinkingHeight(int contentWidth) {
-            if (!thinkingSection.isVisible()) return 0;
-            int height = thinkingToggle.getPreferredSize().height + 4;
-            if (thinkingExpanded) {
-                thinking.setSize(new Dimension(contentWidth, Short.MAX_VALUE));
-                height += thinking.getPreferredSize().height + 6;
-            }
-            return height;
+        /** Wrapped text only reports its height once it has a width to wrap at. */
+        private static int wrappedHeight(javax.swing.text.JTextComponent text, int width) {
+            text.setSize(new Dimension(width, Short.MAX_VALUE));
+            return text.getPreferredSize().height;
         }
 
         private int preferredBubbleWidth() {
             int max = maxBubbleWidth();
-            String text = body.getText();
+            String text = raw.toString();
             // Reasoning is long and wraps badly in a narrow bubble, so an expanded thinking area takes
             // the full column even before the first answer token arrives.
             if (!user && thinkingExpanded()) return max;
-            if (text == null || text.isBlank()) {
+            if (text.isBlank()) {
                 return user ? Math.min(max, 220) : Math.min(max, Math.max(280, availableWidth * 70 / 100));
             }
 
@@ -864,8 +860,7 @@ public final class AskPanel extends JPanel {
             }
 
             // Single-line / short messages hug content, but stay readable.
-            Font font = body.getFont();
-            int textWidth = body.getFontMetrics(font).stringWidth(text.replace('\n', ' '));
+            int textWidth = body.getFontMetrics(body.getFont()).stringWidth(text.replace('\n', ' '));
             int desired = textWidth + BUBBLE_INNER_PAD_X * 2 + 8;
             int min = user ? 120 : 180;
             return Math.min(max, Math.max(min, desired));
@@ -873,27 +868,19 @@ public final class AskPanel extends JPanel {
 
         @Override
         public Dimension getPreferredSize() {
-            return measure(preferredBubbleWidth());
+            int width = preferredBubbleWidth();
+            return new Dimension(width, heightAt(width));
         }
 
         @Override
         public Dimension getMinimumSize() {
-            return measure(Math.min(200, maxBubbleWidth()));
+            int width = Math.min(200, maxBubbleWidth());
+            return new Dimension(width, heightAt(width));
         }
 
         @Override
         public Dimension getMaximumSize() {
-            Dimension preferred = getPreferredSize();
-            return new Dimension(preferred.width, preferred.height);
-        }
-
-        @Override
-        public void doLayout() {
-            Dimension size = getPreferredSize();
-            if (getWidth() != size.width || getHeight() != size.height) {
-                setSize(size);
-            }
-            super.doLayout();
+            return getPreferredSize();
         }
 
         @Override
