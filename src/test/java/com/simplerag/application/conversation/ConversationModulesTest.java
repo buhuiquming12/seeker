@@ -13,21 +13,44 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ConversationModulesTest {
+    /**
+     * The saved transcript outlives a rebuild; the model's memory of it must not. A revision change
+     * hands out a fresh session so answers grounded in files that have since moved cannot be quoted
+     * back as if they still held.
+     */
     @Test
-    void historyIsBoundToKnowledgeBaseAndRevision() {
+    void theModelVisibleHistoryIsBoundToTheConversationAndRevision() {
         ConversationStore store = new ConversationStore();
-        ConversationSession first = store.openOrReplace("kb-1", 1L);
+        ConversationSession first = store.openOrReplace("conversation-1", 1L);
         first.appendUser("hello");
         first.appendAssistant("hi");
 
-        ConversationSession same = store.openOrReplace("kb-1", 1L);
+        ConversationSession same = store.openOrReplace("conversation-1", 1L);
         assertSame(first, same);
         assertEquals(2, same.size());
 
-        ConversationSession revised = store.openOrReplace("kb-1", 2L);
+        ConversationSession revised = store.openOrReplace("conversation-1", 2L);
         assertNotSame(first, revised);
         assertTrue(revised.isEmpty());
-        assertFalse(revised.matches("kb-1", 1L));
+        assertFalse(revised.matches("conversation-1", 1L));
+        assertFalse(revised.loaded(), "a replaced session still has to be told what is on disk");
+    }
+
+    /** Seeding is what makes a conversation survive a restart, and it respects the same budget. */
+    @Test
+    void aLoadedSessionIsTrimmedLikeOneThatGrewTurnByTurn() {
+        ConversationSession session = new ConversationSession("conversation-1", 4L,
+                new ConversationContext(4, 200));
+        List<ChatMessage> saved = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            saved.add(ChatMessage.user("question-" + i + "-" + "x".repeat(20)));
+            saved.add(ChatMessage.assistant("answer-" + i + "-" + "y".repeat(20)));
+        }
+        session.load(saved);
+
+        assertTrue(session.loaded());
+        assertTrue(session.size() <= 4, "loaded history bypassed the budget: " + session.size());
+        assertEquals(ChatMessage.Role.USER, session.messages().get(0).role());
     }
 
     @Test

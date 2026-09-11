@@ -14,6 +14,7 @@ import com.simplerag.application.usecase.FileExplorerUseCase;
 import com.simplerag.application.usecase.IndexBuildUseCase;
 import com.simplerag.application.usecase.KnowledgeBaseUseCases;
 import com.simplerag.application.usecase.KnowledgeSourceUseCases;
+import com.simplerag.application.usecase.ConversationUseCase;
 import com.simplerag.application.usecase.LocalModelUseCase;
 import com.simplerag.application.usecase.SearchUseCase;
 import com.simplerag.application.usecase.WorkspaceLayoutUseCase;
@@ -28,6 +29,7 @@ import com.simplerag.adapter.out.openai.OpenAiCompatibleReranker;
 import com.simplerag.search.FeatureReranker;
 import com.simplerag.adapter.out.sqlite.AppRepository;
 import com.simplerag.adapter.out.sqlite.DatabaseManager;
+import com.simplerag.adapter.out.sqlite.SqliteConversationRepository;
 import com.simplerag.adapter.out.security.SecretCodec;
 import com.simplerag.adapter.out.security.WindowsCredentialManagerSecretStore;
 import com.simplerag.adapter.out.diagnostics.InMemoryDiagnosticLog;
@@ -114,12 +116,14 @@ public final class AppCompositionRoot {
             FileExplorerUseCase explorer = new FileExplorerUseCase(runtime, sqlite);
             DesktopQueryService desktopQueries = new DesktopQueryService(service);
             WorkspaceLayoutUseCase workspaceLayout = new WorkspaceLayoutUseCase(sqlite);
+            ConversationUseCase conversations = new ConversationUseCase(
+                    new SqliteConversationRepository(database));
             progress.stage("正在准备界面…");
             SwingUtilities.invokeLater(() -> {
                 MainFrame frame = new MainFrame(
                         new KnowledgeController(knowledgeBases, sources, indexBuild, desktopQueries,
                                 localModel),
-                        new SearchController(search), new AskController(ask, service,
+                        new SearchController(search), new AskController(ask, service, conversations,
                                 new ConversationStore(ConversationContext.defaults(tokens))),
                         new FileBrowserController(explorer),
                         new BackgroundTaskCoordinator(), new SystemDesktopFileGateway(),

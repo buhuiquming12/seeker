@@ -1,7 +1,10 @@
 package com.simplerag.adapter.in.swing;
 
 import com.simplerag.application.conversation.AnswerDelta;
+import com.simplerag.application.conversation.ChatMessage;
+import com.simplerag.application.conversation.StoredMessage;
 import com.simplerag.application.dto.CitationView;
+import com.simplerag.application.dto.ConversationView;
 import com.simplerag.application.dto.DocumentReference;
 import org.junit.jupiter.api.Test;
 
@@ -224,6 +227,90 @@ class AskPanelTest {
     private static CitationView citation(int number, String fileName) {
         return new CitationView(number, new DocumentReference("chunk-" + number,
                 Path.of("kb", fileName), fileName, "java", 1, 9, "内容", false), 0.9);
+    }
+
+    /**
+     * A saved conversation spans source revisions; the model's memory of it does not. The transcript
+     * has to say where that restart happened or it claims a continuity the model never had.
+     */
+    @Test
+    void aRestoredTranscriptMarksEveryRevisionTheModelRestartedAt() throws Exception {
+        AtomicReference<AskPanel> panel = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            AskPanel created = new AskPanel(() -> { }, () -> { }, () -> { }, () -> { });
+            created.showTranscript(List.of(
+                    stored(ChatMessage.user("重建前问的"), 7L),
+                    stored(ChatMessage.assistant("重建前答的"), 7L),
+                    stored(ChatMessage.user("重建后问的"), 8L),
+                    stored(ChatMessage.assistant("重建后答的"), 8L)));
+            panel.set(created);
+        });
+
+        assertTrue(panel.get().conversationText().contains("重建前问的"));
+        assertTrue(panel.get().conversationText().contains("重建后答的"));
+        assertTrue(panel.get().contextBreakMessage().contains("revision 8"),
+                panel.get().contextBreakMessage());
+        // The marker is page state, not something the copy action should paste.
+        assertFalse(panel.get().conversationText().contains("revision 8"));
+    }
+
+    @Test
+    void aTranscriptWithinOneRevisionHasNoMarker() throws Exception {
+        AtomicReference<AskPanel> panel = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            AskPanel created = new AskPanel(() -> { }, () -> { }, () -> { }, () -> { });
+            created.showTranscript(List.of(stored(ChatMessage.user("问"), 7L),
+                    stored(ChatMessage.assistant("答"), 7L)));
+            panel.set(created);
+        });
+
+        assertEquals("", panel.get().contextBreakMessage());
+    }
+
+    /**
+     * Rebuilding the list must not look like the user clicking through every row on the way to the
+     * active one - each of those would load a different transcript.
+     */
+    @Test
+    void listingConversationsSelectsTheActiveOneWithoutReportingAClick() throws Exception {
+        List<String> opened = new java.util.ArrayList<>();
+        AtomicReference<AskPanel> panel = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            AskPanel created = new AskPanel(() -> { }, () -> { }, () -> { }, () -> { },
+                    conversation -> opened.add(conversation.id()), conversation -> { });
+            created.conversations(List.of(conversation("c-1", "索引怎么构建？", 4),
+                    conversation("c-2", "", 0), conversation("c-3", "登录校验在哪？", 2)), "c-3");
+            panel.set(created);
+        });
+
+        assertEquals(3, panel.get().conversationCount());
+        assertEquals("c-3", panel.get().selectedConversation().id());
+        assertTrue(opened.isEmpty(), "the page loaded transcripts it was never asked for: " + opened);
+    }
+
+    @Test
+    void clickingAConversationReportsIt() throws Exception {
+        List<String> opened = new java.util.ArrayList<>();
+        AtomicReference<AskPanel> panel = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            AskPanel created = new AskPanel(() -> { }, () -> { }, () -> { }, () -> { },
+                    conversation -> opened.add(conversation.id()), conversation -> { });
+            created.conversations(List.of(conversation("c-1", "索引怎么构建？", 4),
+                    conversation("c-2", "登录校验在哪？", 2)), "c-1");
+            created.conversationList().setSelectedIndex(1);
+            panel.set(created);
+        });
+
+        assertEquals(List.of("c-2"), opened);
+    }
+
+    private static StoredMessage stored(ChatMessage message, long revision) {
+        return new StoredMessage(message, revision);
+    }
+
+    private static ConversationView conversation(String id, String title, int messages) {
+        long now = System.currentTimeMillis();
+        return new ConversationView(id, "kb-1", title, messages, now, now);
     }
 
     @Test

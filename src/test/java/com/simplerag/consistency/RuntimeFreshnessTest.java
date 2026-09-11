@@ -9,6 +9,7 @@ import com.simplerag.adapter.out.security.SecretCodec;
 import com.simplerag.adapter.out.sqlite.AppRepository;
 import com.simplerag.adapter.out.sqlite.DatabaseManager;
 import com.simplerag.application.usecase.KnowledgeService;
+import com.simplerag.application.usecase.StaleTaskException;
 import com.simplerag.embedding.EmbeddingProvider;
 import com.simplerag.model.IndexStatus;
 import com.simplerag.rag.ApiConfig;
@@ -116,7 +117,7 @@ class RuntimeFreshnessTest {
                 executor.shutdownNow();
             }
 
-            service.rebuildCurrent(null);
+            rebuildUntilNotStale(service);
             await(() -> service.indexStatus() == IndexStatus.READY, Duration.ofSeconds(5));
             Thread.sleep(250);
             assertEquals(IndexStatus.READY, service.indexStatus());
@@ -199,6 +200,27 @@ class RuntimeFreshnessTest {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (!condition.getAsBoolean() && System.nanoTime() < deadline) Thread.sleep(20);
         assertTrue(condition.getAsBoolean(), "condition was not met within " + timeout);
+    }
+
+    /**
+     * Rebuilds, retrying while the watcher is still catching up.
+     *
+     * <p>The write that broke the previous build is detected asynchronously, so its event can land
+     * during this rebuild too and discard that one as well - which is the monitor working, not a
+     * failure. The application answers a discarded build by running another one, so the test does.
+     * What is being asserted is the state it settles on, and that nothing dirties it afterwards.
+     */
+    private static void rebuildUntilNotStale(KnowledgeService service) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (true) {
+            try {
+                service.rebuildCurrent(null);
+                return;
+            } catch (StaleTaskException discarded) {
+                if (System.nanoTime() >= deadline) throw discarded;
+                Thread.sleep(50);
+            }
+        }
     }
 
     private static class TestEmbeddingProvider implements EmbeddingProvider {

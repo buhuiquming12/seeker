@@ -96,6 +96,39 @@ public final class DatabaseManager {
                         statement.executeUpdate("ALTER TABLE knowledge_base ADD COLUMN last_verified_at INTEGER");
                         statement.executeUpdate("ALTER TABLE knowledge_base ADD COLUMN freshness_reason TEXT NOT NULL DEFAULT ''");
                         statement.executeUpdate("UPDATE schema_version SET version = 3");
+                        version = 3;
+                    }
+                    if (version < 4) {
+                        // Conversations used to live in a map that died with the process. They cascade
+                        // from the knowledge base because an answer only means anything next to the
+                        // files it was grounded in.
+                        statement.executeUpdate("""
+                                CREATE TABLE conversation (
+                                  id TEXT PRIMARY KEY,
+                                  knowledge_base_id TEXT NOT NULL,
+                                  title TEXT NOT NULL DEFAULT '',
+                                  created_at INTEGER NOT NULL,
+                                  updated_at INTEGER NOT NULL,
+                                  FOREIGN KEY(knowledge_base_id) REFERENCES knowledge_base(id) ON DELETE CASCADE
+                                )
+                                """);
+                        statement.executeUpdate(
+                                "CREATE INDEX idx_conversation_base ON conversation(knowledge_base_id, updated_at DESC)");
+                        statement.executeUpdate("""
+                                CREATE TABLE conversation_message (
+                                  id TEXT PRIMARY KEY,
+                                  conversation_id TEXT NOT NULL,
+                                  seq INTEGER NOT NULL,
+                                  role TEXT NOT NULL,
+                                  content TEXT NOT NULL,
+                                  source_revision INTEGER NOT NULL,
+                                  created_at INTEGER NOT NULL,
+                                  FOREIGN KEY(conversation_id) REFERENCES conversation(id) ON DELETE CASCADE
+                                )
+                                """);
+                        statement.executeUpdate(
+                                "CREATE INDEX idx_conversation_message_seq ON conversation_message(conversation_id, seq)");
+                        statement.executeUpdate("UPDATE schema_version SET version = 4");
                     }
                     connection.commit();
                 } catch (Exception failure) {

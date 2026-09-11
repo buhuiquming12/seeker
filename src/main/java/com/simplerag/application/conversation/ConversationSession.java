@@ -1,50 +1,46 @@
 package com.simplerag.application.conversation;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.UUID;
 
 /**
- * In-memory multi-turn session bound to a single knowledgeBaseId + sourceRevision.
- * When the binding changes, callers must open a new session rather than reuse history.
+ * The turns of one conversation that the model is still allowed to remember.
+ *
+ * <p>Bound to a conversation plus the source revision it is being continued at. The saved transcript
+ * outlives a revision change; this does not - answers above the change were grounded in files that
+ * have since moved, so a new binding starts from nothing and the page marks where that happened.
  */
 public final class ConversationSession {
-    private final String id;
-    private final String knowledgeBaseId;
+    private final String conversationId;
     private final long sourceRevision;
     private final List<ChatMessage> messages = new ArrayList<>();
     private final ConversationContext contextPolicy;
+    private boolean loaded;
 
-    public ConversationSession(String knowledgeBaseId, long sourceRevision) {
-        this(knowledgeBaseId, sourceRevision, ConversationContext.defaults());
+    public ConversationSession(String conversationId, long sourceRevision) {
+        this(conversationId, sourceRevision, ConversationContext.defaults());
     }
 
-    public ConversationSession(String knowledgeBaseId, long sourceRevision, ConversationContext contextPolicy) {
-        this.id = UUID.randomUUID().toString();
-        this.knowledgeBaseId = Objects.requireNonNull(knowledgeBaseId, "knowledgeBaseId").strip();
-        if (this.knowledgeBaseId.isEmpty()) {
-            throw new IllegalArgumentException("knowledgeBaseId 不能为空");
+    public ConversationSession(String conversationId, long sourceRevision, ConversationContext contextPolicy) {
+        this.conversationId = Objects.requireNonNull(conversationId, "conversationId").strip();
+        if (this.conversationId.isEmpty()) {
+            throw new IllegalArgumentException("conversationId 不能为空");
         }
         this.sourceRevision = sourceRevision;
         this.contextPolicy = Objects.requireNonNull(contextPolicy, "contextPolicy");
     }
 
     public String id() {
-        return id;
-    }
-
-    public String knowledgeBaseId() {
-        return knowledgeBaseId;
+        return conversationId;
     }
 
     public long sourceRevision() {
         return sourceRevision;
     }
 
-    public synchronized boolean matches(String knowledgeBaseId, long sourceRevision) {
-        return this.knowledgeBaseId.equals(knowledgeBaseId) && this.sourceRevision == sourceRevision;
+    public synchronized boolean matches(String conversationId, long sourceRevision) {
+        return this.conversationId.equals(conversationId) && this.sourceRevision == sourceRevision;
     }
 
     public synchronized List<ChatMessage> messages() {
@@ -71,6 +67,25 @@ public final class ConversationSession {
 
     public synchronized void clear() {
         messages.clear();
+    }
+
+    /**
+     * Whether this session has been given the turns already on disk.
+     *
+     * <p>A session is created empty and only the caller knows where its history comes from, so the
+     * flag - not emptiness - is what says the lookup has happened: a conversation that really has no
+     * turns at this revision would otherwise be read again before every question.
+     */
+    public synchronized boolean loaded() {
+        return loaded;
+    }
+
+    /** Seeds this session from saved turns, trimming them to the context budget as if appended. */
+    public synchronized void load(List<ChatMessage> history) {
+        messages.clear();
+        messages.addAll(Objects.requireNonNull(history, "history"));
+        trimInPlace();
+        loaded = true;
     }
 
     /**
@@ -106,7 +121,7 @@ public final class ConversationSession {
 
     @Override
     public String toString() {
-        return "ConversationSession{id='" + id + "', knowledgeBaseId='" + knowledgeBaseId
+        return "ConversationSession{conversationId='" + conversationId
                 + "', sourceRevision=" + sourceRevision + ", messages=" + messages.size() + '}';
     }
 }

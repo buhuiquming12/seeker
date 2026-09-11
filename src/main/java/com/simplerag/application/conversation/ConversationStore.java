@@ -8,9 +8,11 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * In-memory conversation sessions keyed by knowledgeBaseId.
- * SQLite persistence is intentionally out of scope for this commit.
- * A session is replaced when sourceRevision changes so old citations cannot be reused.
+ * The model-visible half of a conversation, cached per conversation id.
+ *
+ * <p>The transcript itself is durable and lives in the repository; what is held here is only the
+ * window of it the model is allowed to see. A session is replaced when sourceRevision changes so
+ * answers grounded in files that have since moved cannot be quoted back as if they still held.
  */
 public final class ConversationStore {
     private final Map<String, ConversationSession> sessions = new ConcurrentHashMap<>();
@@ -24,9 +26,9 @@ public final class ConversationStore {
         this.contextPolicy = Objects.requireNonNull(contextPolicy, "contextPolicy");
     }
 
-    public ConversationSession openOrReplace(String knowledgeBaseId, long sourceRevision) {
-        Objects.requireNonNull(knowledgeBaseId, "knowledgeBaseId");
-        String key = TextValues.trimToEmpty(knowledgeBaseId);
+    public ConversationSession openOrReplace(String conversationId, long sourceRevision) {
+        Objects.requireNonNull(conversationId, "conversationId");
+        String key = TextValues.trimToEmpty(conversationId);
         return sessions.compute(key, (ignored, existing) -> {
             if (existing != null && existing.matches(key, sourceRevision)) {
                 return existing;
@@ -35,26 +37,26 @@ public final class ConversationStore {
         });
     }
 
-    public Optional<ConversationSession> find(String knowledgeBaseId) {
-        if (knowledgeBaseId == null) {
+    public Optional<ConversationSession> find(String conversationId) {
+        if (conversationId == null) {
             return Optional.empty();
         }
-        return Optional.ofNullable(sessions.get(TextValues.trimToEmpty(knowledgeBaseId)));
+        return Optional.ofNullable(sessions.get(TextValues.trimToEmpty(conversationId)));
     }
 
-    public ConversationSession requireMatching(String knowledgeBaseId, long sourceRevision) {
-        ConversationSession session = openOrReplace(knowledgeBaseId, sourceRevision);
-        if (!session.matches(knowledgeBaseId, sourceRevision)) {
+    public ConversationSession requireMatching(String conversationId, long sourceRevision) {
+        ConversationSession session = openOrReplace(conversationId, sourceRevision);
+        if (!session.matches(conversationId, sourceRevision)) {
             throw new IllegalStateException("会话与当前知识库版本不一致，请重新开始对话");
         }
         return session;
     }
 
-    public void clear(String knowledgeBaseId) {
-        if (knowledgeBaseId == null) {
+    public void clear(String conversationId) {
+        if (conversationId == null) {
             return;
         }
-        sessions.remove(TextValues.trimToEmpty(knowledgeBaseId));
+        sessions.remove(TextValues.trimToEmpty(conversationId));
     }
 
     public void clearAll() {

@@ -47,10 +47,10 @@ class SettingsPanelTest {
 
     @Test
     void normalizesFullEmbeddingAndRerankEndpointsBeforeListingModels() {
-        ApiConfig embedding = DesktopWorkspaceController.modelListConfig(
+        ApiConfig embedding = ModelSettingsCoordinator.modelListConfig(
                 new ApiConfig("https://provider.example/v1/embeddings", "key", "embed"),
                 SettingsPanel.ModelKind.EMBEDDING);
-        ApiConfig rerank = DesktopWorkspaceController.modelListConfig(
+        ApiConfig rerank = ModelSettingsCoordinator.modelListConfig(
                 new ApiConfig("https://provider.example/v1/rerank", "key", "rerank"),
                 SettingsPanel.ModelKind.RERANK);
 

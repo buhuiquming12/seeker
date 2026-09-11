@@ -2,7 +2,9 @@ package com.simplerag.adapter.in.swing;
 
 import com.simplerag.application.conversation.AnswerDelta;
 import com.simplerag.application.conversation.ChatMessage;
+import com.simplerag.application.conversation.StoredMessage;
 import com.simplerag.application.dto.CitationView;
+import com.simplerag.application.dto.ConversationView;
 
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -19,6 +21,8 @@ import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextArea;
+import javax.swing.KeyStroke;
+import javax.swing.ListSelectionModel;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
@@ -36,15 +40,22 @@ import java.awt.Insets;
 import java.awt.RenderingHints;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
+import java.awt.event.ActionEvent;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
-/** Knowledge-question page: multi-turn chat transcript + composer + citations sidebar. */
+/** Knowledge-question page: saved conversations + multi-turn transcript + composer + citations. */
 public final class AskPanel extends JPanel {
     private static final int BUBBLE_INNER_PAD_X = 16;
     private static final int BUBBLE_INNER_PAD_Y = 12;
@@ -59,10 +70,12 @@ public final class AskPanel extends JPanel {
     private final JTextArea question = new JTextArea(3, 30);
     private final JLabel conversationTitle = new JLabel("对话");
     private final JLabel conversationMeta = new JLabel("多轮上下文已启用 · 切换知识库或版本会自动清空");
-    private final JButton clearChat = new JButton("清空对话");
+    private final JButton newConversation = new JButton("＋ 新对话");
     private final JButton ask = new JButton("发送");
     private final DefaultListModel<CitationView> citations = new DefaultListModel<>();
     private final JList<CitationView> citationList = new JList<>(citations);
+    private final DefaultListModel<ConversationView> conversations = new DefaultListModel<>();
+    private final JList<ConversationView> conversationList = new JList<>(conversations);
     private final JPanel transcript = new JPanel();
     private final JScrollPane transcriptScroll;
     private final JPanel emptyState;
@@ -72,10 +85,21 @@ public final class AskPanel extends JPanel {
     private JPanel lastBreak;
     private String lastBreakMessage = "";
     private final Runnable onOpenCitation;
+    private final Consumer<ConversationView> onDeleteConversation;
+    /** Set while the list is being rebuilt, so a programmatic selection is not read as a click. */
+    private boolean syncingConversations;
 
-    public AskPanel(Runnable onAsk, Runnable onSave, Runnable onOpenCitation, Runnable onClearChat) {
+    /** For panel tests that do not exercise the session list. */
+    AskPanel(Runnable onAsk, Runnable onSave, Runnable onOpenCitation, Runnable onNewConversation) {
+        this(onAsk, onSave, onOpenCitation, onNewConversation, conversation -> { }, conversation -> { });
+    }
+
+    public AskPanel(Runnable onAsk, Runnable onSave, Runnable onOpenCitation, Runnable onNewConversation,
+                    Consumer<ConversationView> onSelectConversation,
+                    Consumer<ConversationView> onDeleteConversation) {
         super(new BorderLayout());
         this.onOpenCitation = onOpenCitation;
+        this.onDeleteConversation = onDeleteConversation;
         Theme.opaque(this, Theme.BACKGROUND);
         transcript.setLayout(new BoxLayout(transcript, BoxLayout.Y_AXIS));
         Theme.opaque(transcript, Theme.BACKGROUND);
@@ -93,7 +117,7 @@ public final class AskPanel extends JPanel {
             }
         });
         add(buildPrivacyPanel(onSave), BorderLayout.NORTH);
-        add(buildChatPanel(onAsk, onClearChat), BorderLayout.CENTER);
+        add(buildChatPanel(onAsk, onNewConversation, onSelectConversation), BorderLayout.CENTER);
         citationList.addMouseListener(new MouseAdapter() {
             @Override public void mouseClicked(MouseEvent event) {
                 if (event.getClickCount() == 2) onOpenCitation.run();
@@ -197,9 +221,23 @@ public final class AskPanel extends JPanel {
                 ? 0 : bubble.getParent().getMaximumSize().height;
     }
 
-    public void showMessages(List<ChatMessage> messages) {
+    /**
+     * Draws a saved conversation.
+     *
+     * <p>The transcript outlives a source revision, but the model's memory of it does not, so a
+     * marker goes wherever the revision changes between two turns. Without them the page would
+     * present one continuous conversation when the model saw several separate ones.
+     */
+    public void showTranscript(List<StoredMessage> messages) {
         resetTranscript();
-        for (ChatMessage message : messages) {
+        long previousRevision = messages.isEmpty() ? 0L : messages.get(0).sourceRevision();
+        for (StoredMessage stored : messages) {
+            if (stored.sourceRevision() != previousRevision) {
+                addContextBreak("源文件已变化（revision " + stored.sourceRevision()
+                        + "）· 模型从这里开始新的上下文");
+            }
+            previousRevision = stored.sourceRevision();
+            ChatMessage message = stored.message();
             addBubble(message.role() == ChatMessage.Role.USER, message.content(), false);
         }
         if (bubbles.isEmpty()) {
@@ -207,6 +245,30 @@ public final class AskPanel extends JPanel {
         }
         revalidateTranscript(true);
     }
+
+    /** The saved conversations of the current knowledge base, newest first. */
+    public void conversations(List<ConversationView> values, String activeId) {
+        syncingConversations = true;
+        try {
+            conversations.clear();
+            int active = -1;
+            for (ConversationView conversation : values) {
+                if (conversation.id().equals(activeId)) active = conversations.size();
+                conversations.addElement(conversation);
+            }
+            conversationList.setSelectedIndex(active);
+            if (active >= 0) conversationList.ensureIndexIsVisible(active);
+        } finally {
+            syncingConversations = false;
+        }
+    }
+
+    public ConversationView selectedConversation() { return conversationList.getSelectedValue(); }
+
+    int conversationCount() { return conversations.size(); }
+
+    /** The list itself, so panel tests can select a row the way a click does. */
+    JList<ConversationView> conversationList() { return conversationList; }
 
     public void beginTurn(String userText) {
         removeEmptyState();
@@ -313,11 +375,15 @@ public final class AskPanel extends JPanel {
         if (lastBreak != null && last >= 0 && transcript.getComponent(last) == lastBreak) {
             transcript.remove(lastBreak);
         }
+        addContextBreak(message);
+        conversationMeta(lastBreakMessage);
+        revalidateTranscript(true);
+    }
+
+    private void addContextBreak(String message) {
         lastBreakMessage = message == null ? "" : message;
         lastBreak = buildContextBreak(lastBreakMessage);
         transcript.add(lastBreak);
-        conversationMeta(lastBreakMessage);
-        revalidateTranscript(true);
     }
 
     /** The marker currently shown, or empty when the transcript claims one continuous context. */
@@ -344,7 +410,8 @@ public final class AskPanel extends JPanel {
     public void asking(boolean value) {
         ask.setText(value ? "停止" : "发送");
         question.setEnabled(!value);
-        clearChat.setEnabled(!value);
+        newConversation.setEnabled(!value);
+        conversationList.setEnabled(!value);
     }
 
     /**
@@ -439,7 +506,8 @@ public final class AskPanel extends JPanel {
         }
     }
 
-    private JPanel buildChatPanel(Runnable onAsk, Runnable onClearChat) {
+    private JPanel buildChatPanel(Runnable onAsk, Runnable onNewConversation,
+                                  Consumer<ConversationView> onSelectConversation) {
         JPanel panel = new JPanel(new BorderLayout(0, 0));
         Theme.opaque(panel, Theme.BACKGROUND);
         panel.setBorder(Theme.padding(0, 0, 0, 0));
@@ -458,9 +526,6 @@ public final class AskPanel extends JPanel {
         titles.add(Box.createVerticalStrut(3));
         titles.add(conversationMeta);
         header.add(titles, BorderLayout.CENTER);
-        Theme.styleButton(clearChat, false);
-        clearChat.setMargin(new Insets(7, 12, 7, 12));
-        clearChat.addActionListener(e -> onClearChat.run());
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
         actions.setOpaque(false);
         JButton copyConversation = new JButton("复制对话");
@@ -474,8 +539,6 @@ public final class AskPanel extends JPanel {
         actions.add(copyAnswer);
         actions.add(Box.createHorizontalStrut(8));
         actions.add(copyConversation);
-        actions.add(Box.createHorizontalStrut(8));
-        actions.add(clearChat);
         header.add(actions, BorderLayout.EAST);
 
         JPanel citationPanel = new JPanel(new BorderLayout(0, 8));
@@ -507,9 +570,18 @@ public final class AskPanel extends JPanel {
         citationPanel.setPreferredSize(new Dimension(260, 100));
         citationPanel.setMinimumSize(new Dimension(220, 100));
 
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, transcriptScroll, citationPanel);
-        split.setResizeWeight(0.78);
-        split.setDividerLocation(820);
+        JSplitPane reading = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, transcriptScroll, citationPanel);
+        reading.setResizeWeight(0.78);
+        reading.setDividerLocation(620);
+        reading.setDividerSize(1);
+        reading.setBorder(null);
+        reading.setBackground(Theme.BORDER);
+
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
+                buildConversationPanel(onNewConversation, onSelectConversation), reading);
+        // Weight 0: widening the window gives the extra room to the transcript, not to the list.
+        split.setResizeWeight(0);
+        split.setDividerLocation(210);
         split.setDividerSize(1);
         split.setBorder(null);
         split.setBackground(Theme.BORDER);
@@ -518,6 +590,65 @@ public final class AskPanel extends JPanel {
         panel.add(split, BorderLayout.CENTER);
         panel.add(composer(onAsk), BorderLayout.SOUTH);
         return panel;
+    }
+
+    /** Saved conversations of the current knowledge base: switch, start a new one, delete one. */
+    private JPanel buildConversationPanel(Runnable onNewConversation,
+                                          Consumer<ConversationView> onSelectConversation) {
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        Theme.opaque(panel, Theme.PANEL);
+        panel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 0, 1, Theme.BORDER), Theme.padding(14, 12, 12, 12)));
+
+        JPanel heading = new JPanel(new BorderLayout(0, 6));
+        heading.setOpaque(false);
+        JLabel title = new JLabel("对话记录");
+        title.setForeground(Theme.TEXT);
+        title.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 12f));
+        JLabel hint = new JLabel("按知识库保存 · 右键或 Delete 删除");
+        hint.setForeground(Theme.MUTED);
+        hint.setFont(Theme.UI_FONT.deriveFont(10f));
+        JPanel labels = new JPanel();
+        labels.setOpaque(false);
+        labels.setLayout(new BoxLayout(labels, BoxLayout.Y_AXIS));
+        labels.add(title);
+        labels.add(hint);
+        heading.add(labels, BorderLayout.CENTER);
+        Theme.styleButton(newConversation, true);
+        newConversation.setMargin(new Insets(7, 10, 7, 10));
+        newConversation.setToolTipText("开始一段新对话，当前对话会保留在列表里");
+        newConversation.addActionListener(event -> onNewConversation.run());
+        heading.add(newConversation, BorderLayout.SOUTH);
+        panel.add(heading, BorderLayout.NORTH);
+
+        conversationList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        conversationList.setBackground(Theme.PANEL);
+        conversationList.setFixedCellHeight(52);
+        conversationList.setCellRenderer(new ConversationRenderer());
+        conversationList.addListSelectionListener(event -> {
+            if (event.getValueIsAdjusting() || syncingConversations) return;
+            ConversationView selected = conversationList.getSelectedValue();
+            if (selected != null) onSelectConversation.accept(selected);
+        });
+        JPopupMenu menu = new JPopupMenu();
+        JMenuItem delete = new JMenuItem("删除这段对话");
+        delete.addActionListener(event -> deleteSelectedConversation());
+        menu.add(delete);
+        conversationList.setComponentPopupMenu(menu);
+        conversationList.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0), "delete-conversation");
+        conversationList.getActionMap().put("delete-conversation", new javax.swing.AbstractAction() {
+            @Override public void actionPerformed(ActionEvent event) { deleteSelectedConversation(); }
+        });
+
+        panel.add(scroll(conversationList), BorderLayout.CENTER);
+        panel.setPreferredSize(new Dimension(210, 100));
+        panel.setMinimumSize(new Dimension(150, 100));
+        return panel;
+    }
+
+    private void deleteSelectedConversation() {
+        ConversationView selected = conversationList.getSelectedValue();
+        if (selected != null && conversationList.isEnabled()) onDeleteConversation.accept(selected);
     }
 
     private JPanel buildEmptyState() {
@@ -940,6 +1071,48 @@ public final class AskPanel extends JPanel {
             g2.dispose();
             super.paintComponent(g);
         }
+    }
+
+    private static final class ConversationRenderer extends JPanel
+            implements javax.swing.ListCellRenderer<ConversationView> {
+        private final JLabel title = new JLabel();
+        private final JLabel meta = new JLabel();
+
+        private ConversationRenderer() {
+            super(new BorderLayout(0, 2));
+            title.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 11f));
+            meta.setFont(Theme.UI_FONT.deriveFont(9f));
+            add(title, BorderLayout.CENTER);
+            add(meta, BorderLayout.SOUTH);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends ConversationView> list,
+                                                      ConversationView value, int index,
+                                                      boolean selected, boolean focused) {
+            setBackground(selected ? Theme.HOVER : Theme.PANEL);
+            setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createMatteBorder(0, selected ? 3 : 0, 1, 0,
+                            selected ? Theme.ACCENT : Theme.BORDER),
+                    Theme.padding(8, selected ? 6 : 9, 8, 8)));
+            title.setText(value.label());
+            title.setForeground(selected ? Theme.TEXT : new Color(200, 210, 216));
+            meta.setText(value.empty() ? "还没有提问" : value.messageCount() + " 条 · " + when(value.updatedAt()));
+            meta.setForeground(Theme.MUTED);
+            setToolTipText(value.label());
+            return this;
+        }
+    }
+
+    /** Time of day for today, a date before that: the list is one line and mostly shows today. */
+    private static String when(long epochMillis) {
+        LocalDateTime moment = LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMillis),
+                ZoneId.systemDefault());
+        if (moment.toLocalDate().equals(LocalDate.now())) {
+            return String.format("%02d:%02d", moment.getHour(), moment.getMinute());
+        }
+        return String.format("%d-%02d-%02d", moment.getYear(), moment.getMonthValue(),
+                moment.getDayOfMonth());
     }
 
     private static final class CitationRenderer extends JPanel implements javax.swing.ListCellRenderer<CitationView> {
