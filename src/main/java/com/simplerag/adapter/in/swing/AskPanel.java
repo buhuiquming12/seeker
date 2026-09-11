@@ -50,6 +50,9 @@ public final class AskPanel extends JPanel {
     private static final int BUBBLE_INNER_PAD_Y = 12;
     private static final int USER_MAX_WIDTH_RATIO = 78;
     private static final int ASSISTANT_MAX_WIDTH_RATIO = 96;
+    /** Design sizes of the two text surfaces that follow the reading scale. */
+    private static final float COMPOSER_SIZE = 13.5f;
+    private static final float THINKING_SIZE = 11f;
 
     private final JCheckBox localOnly = new JCheckBox("仅本地 RAG（禁止远程发送）");
     private final JLabel policyStatus = new JLabel(" ");
@@ -344,6 +347,16 @@ public final class AskPanel extends JPanel {
         clearChat.setEnabled(!value);
     }
 
+    /**
+     * Re-renders the transcript and the composer at the current reading scale, keeping the scroll
+     * position: zooming is something a reader does part-way through a conversation.
+     */
+    public void applyContentScale() {
+        question.setFont(Theme.contentFont(Theme.UI_FONT, COMPOSER_SIZE));
+        for (BubblePanel bubble : bubbles) bubble.rescale();
+        relayoutBubbles();
+    }
+
     private void resetTranscript() {
         transcript.removeAll();
         bubbles.clear();
@@ -545,10 +558,15 @@ public final class AskPanel extends JPanel {
         card.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(Theme.BORDER),
                 Theme.padding(10, 12, 10, 12)));
+        // The question area has no border of its own, so the card it sits in shows where focus is.
+        question.addFocusListener(new java.awt.event.FocusAdapter() {
+            @Override public void focusGained(java.awt.event.FocusEvent event) { outline(card, Theme.ACCENT); }
+            @Override public void focusLost(java.awt.event.FocusEvent event) { outline(card, Theme.BORDER); }
+        });
 
         question.setLineWrap(true);
         question.setWrapStyleWord(true);
-        question.setFont(Theme.UI_FONT.deriveFont(13.5f));
+        question.setFont(Theme.contentFont(Theme.UI_FONT, COMPOSER_SIZE));
         question.setBackground(Theme.PANEL_ALT);
         question.setForeground(Theme.TEXT);
         question.setCaretColor(Theme.TEXT);
@@ -581,6 +599,12 @@ public final class AskPanel extends JPanel {
         pane.setBorder(null);
         pane.getViewport().setBackground(Theme.PANEL);
         return pane;
+    }
+
+    private static void outline(JPanel card, Color color) {
+        card.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(color), Theme.padding(10, 12, 10, 12)));
+        card.repaint();
     }
 
     /** Compact per-knowledge-base privacy control; provider credentials live on Settings page. */
@@ -690,7 +714,7 @@ public final class AskPanel extends JPanel {
             thinking.setLineWrap(true);
             thinking.setWrapStyleWord(true);
             thinking.setOpaque(false);
-            thinking.setFont(Theme.UI_FONT.deriveFont(11f));
+            thinking.setFont(Theme.contentFont(Theme.UI_FONT, THINKING_SIZE));
             thinking.setForeground(Theme.MUTED);
             thinking.setBorder(new EmptyBorder(0, 8, 0, 0));
             thinking.setFocusable(true);
@@ -813,6 +837,13 @@ public final class AskPanel extends JPanel {
         void applyAvailableWidth(int available) {
             this.availableWidth = Math.max(240, available);
             revalidate();
+        }
+
+        /** Re-renders this message at the current reading scale; the page re-measures the rows. */
+        void rescale() {
+            thinking.setFont(Theme.contentFont(Theme.UI_FONT, THINKING_SIZE));
+            body.rescale();
+            invalidate();
         }
 
         private int maxBubbleWidth() {

@@ -46,6 +46,8 @@ import java.util.regex.Pattern;
 /** Search page and sole owner of query, result and preview Swing state. */
 public final class SearchPanel extends JPanel {
     private static final Pattern HIGHLIGHT_TERM = Pattern.compile("[\\p{L}\\p{N}_-]{2,}");
+    /** Design size of the chunk preview, which follows the reading scale. */
+    private static final float PREVIEW_SIZE = 13f;
     private final DefaultListModel<SearchResultView> results = new DefaultListModel<>();
     private final JList<SearchResultView> resultList = new JList<>(results);
     private final PromptTextField query = new PromptTextField("搜索笔记、代码和配置...");
@@ -93,6 +95,12 @@ public final class SearchPanel extends JPanel {
     public String extension() { return String.valueOf(extension.getSelectedItem()); }
     public SearchResultView selected() { return resultList.getSelectedValue(); }
     public void focusQuery() { query.requestFocusInWindow(); query.selectAll(); }
+
+    /** Redraws the chunk preview at the current reading scale; the gutter has to match line for line. */
+    public void applyContentScale() {
+        preview.setFont(Theme.contentFont(Theme.MONO_FONT, PREVIEW_SIZE));
+        lineNumbers.setFont(Theme.contentFont(Theme.MONO_FONT, PREVIEW_SIZE));
+    }
     public void clear() { results.clear(); query.setText(""); preview(null); }
     public void searching() { results.clear(); summary.setText("检索中..."); }
     public void searchFailed() { summary.setText("检索失败"); }
@@ -159,12 +167,18 @@ public final class SearchPanel extends JPanel {
         copy.setToolTipText("复制该片段的正文"); locate.setToolTipText("在文件资源管理器中打开所在目录");
         open.setToolTipText("用系统默认程序打开该文件");
         openInApp.setToolTipText("在应用内的文件页打开，并定位到这个片段（双击结果同样生效）");
-        titlePanel.add(labels, BorderLayout.CENTER); titlePanel.add(actions, BorderLayout.EAST); preview.setEditable(false); preview.setFont(Theme.MONO_FONT); preview.setBackground(Theme.PANEL_ALT); preview.setForeground(new Color(218, 226, 230)); preview.setCaretColor(Theme.ACCENT); preview.setTabSize(4); preview.setBorder(Theme.padding(10, 10, 10, 10));
-        lineNumbers.setEditable(false); lineNumbers.setFont(Theme.MONO_FONT); lineNumbers.setBackground(Theme.PANEL); lineNumbers.setForeground(new Color(104, 116, 124)); lineNumbers.setBorder(Theme.padding(10, 8, 10, 8)); lineNumbers.setFocusable(false);
+        titlePanel.add(labels, BorderLayout.CENTER); titlePanel.add(actions, BorderLayout.EAST); preview.setEditable(false); preview.setFont(Theme.contentFont(Theme.MONO_FONT, PREVIEW_SIZE)); preview.setBackground(Theme.PANEL_ALT); preview.setForeground(new Color(218, 226, 230)); preview.setCaretColor(Theme.ACCENT); preview.setTabSize(4); preview.setBorder(Theme.padding(10, 10, 10, 10));
+        lineNumbers.setEditable(false); lineNumbers.setFont(Theme.contentFont(Theme.MONO_FONT, PREVIEW_SIZE)); lineNumbers.setBackground(Theme.PANEL); lineNumbers.setForeground(new Color(104, 116, 124)); lineNumbers.setBorder(Theme.padding(10, 8, 10, 8)); lineNumbers.setFocusable(false);
         JScrollPane scroll = scroll(preview); scroll.setRowHeaderView(lineNumbers); scroll.setBorder(BorderFactory.createLineBorder(Theme.BORDER)); panel.add(titlePanel, BorderLayout.NORTH); panel.add(scroll, BorderLayout.CENTER); return panel; }
     private static JScrollPane scroll(Component component) { JScrollPane pane = new JScrollPane(component); pane.setBorder(null); pane.getViewport().setBackground(Theme.PANEL); return pane; }
 
-    private static final class PromptTextField extends JTextField { private final String prompt; private PromptTextField(String prompt) { this.prompt = prompt; setOpaque(false); setForeground(Theme.TEXT); setCaretColor(Theme.ACCENT); setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(Theme.BORDER), Theme.padding(8, 12, 8, 12))); }
+    private static final class PromptTextField extends JTextField { private final String prompt; private PromptTextField(String prompt) { this.prompt = prompt; setOpaque(false); setForeground(Theme.TEXT); setCaretColor(Theme.ACCENT); outline(Theme.BORDER);
+        // The look and feel draws its focus ring in a border this field replaces, so it draws its own.
+        addFocusListener(new java.awt.event.FocusAdapter() {
+            @Override public void focusGained(java.awt.event.FocusEvent event) { outline(Theme.ACCENT); }
+            @Override public void focusLost(java.awt.event.FocusEvent event) { outline(Theme.BORDER); }
+        }); }
+        private void outline(Color color) { setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(color), Theme.padding(8, 12, 8, 12))); repaint(); }
         @Override protected void paintComponent(Graphics graphics) { graphics.setColor(Theme.PANEL); graphics.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8); super.paintComponent(graphics); if (getText().isEmpty() && !isFocusOwner()) { graphics.setColor(Theme.MUTED); graphics.setFont(getFont()); graphics.drawString(prompt, getInsets().left, getHeight() / 2 + graphics.getFontMetrics().getAscent() / 2 - 2); } } }
     private static final class ResultRenderer extends JPanel implements javax.swing.ListCellRenderer<SearchResultView> { private final JLabel title = new JLabel(); private final JLabel score = new JLabel(); private final JLabel meta = new JLabel(); private final JTextArea excerpt = new JTextArea();
         private ResultRenderer() { super(new BorderLayout(8, 4)); JPanel top = new JPanel(new BorderLayout()); top.setOpaque(false); title.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 12f)); score.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 10f)); top.add(title, BorderLayout.CENTER); top.add(score, BorderLayout.EAST); excerpt.setEditable(false); excerpt.setLineWrap(true); excerpt.setWrapStyleWord(true); excerpt.setRows(2); excerpt.setFont(Theme.UI_FONT.deriveFont(10.5f)); excerpt.setBorder(null); meta.setFont(Theme.UI_FONT.deriveFont(9f)); add(top, BorderLayout.NORTH); add(excerpt, BorderLayout.CENTER); add(meta, BorderLayout.SOUTH); }

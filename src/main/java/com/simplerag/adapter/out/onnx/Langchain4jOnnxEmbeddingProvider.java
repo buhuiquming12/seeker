@@ -25,6 +25,8 @@ import java.util.List;
 public final class Langchain4jOnnxEmbeddingProvider implements EmbeddingProvider {
     // Kept identical to the retired Python provider so existing index snapshots stay compatible.
     public static final String MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2-int8";
+    /** Where the model lives unless {@code -Dsimplerag.modelDir} says otherwise. */
+    public static final String DEFAULT_MODEL_DIRECTORY = "models/multilingual-minilm";
     private static final String MODEL_FILE = "model_quint8_avx2.onnx";
     private static final String TOKENIZER_FILE = "tokenizer.json";
 
@@ -36,7 +38,12 @@ public final class Langchain4jOnnxEmbeddingProvider implements EmbeddingProvider
     private volatile String fileSignature;
 
     public Langchain4jOnnxEmbeddingProvider() {
-        this(Path.of(System.getProperty("simplerag.modelDir", "models/multilingual-minilm")));
+        this(defaultModelDirectory());
+    }
+
+    /** The directory both this provider and the in-app installer have to agree on. */
+    public static Path defaultModelDirectory() {
+        return Path.of(System.getProperty("simplerag.modelDir", DEFAULT_MODEL_DIRECTORY));
     }
 
     public Langchain4jOnnxEmbeddingProvider(Path modelDirectory) {
@@ -130,5 +137,19 @@ public final class Langchain4jOnnxEmbeddingProvider implements EmbeddingProvider
     @Override
     public synchronized void close() {
         model = null;
+    }
+
+    /**
+     * Forgets everything derived from the model files, so an install that happened while the
+     * application was running takes effect without a restart.
+     *
+     * <p>The loaded model, the status text and the file signature that ties an index snapshot to the
+     * model that produced it are all cached on first use. A session that started with no model has
+     * cached the answers for "missing" in all three.
+     */
+    public synchronized void reload() {
+        model = null;
+        fileSignature = null;
+        status = isConfigured() ? "模型已就绪" : "未安装语义模型";
     }
 }

@@ -179,6 +179,43 @@ class AskPanelTest {
                 "row allows " + panel.get().latestAnswerRowHeight() + " for " + rendered + " of text");
     }
 
+    /**
+     * Zoom re-renders the styled document rather than scaling a picture of it, so what has to be
+     * checked is that the answer really got taller and that its row was re-measured to match.
+     */
+    @Test
+    void zoomingRedrawsTheTranscriptAtTheNewReadingSize() throws Exception {
+        AtomicReference<AskPanel> panel = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            AskPanel created = new AskPanel(() -> { }, () -> { }, () -> { }, () -> { });
+            created.beginTurn("索引怎么构建？");
+            created.finishAssistant("""
+                    分三步：扫描、分块、发布 [1]。发布是原子的，先写临时文件再移动到位，
+                    所以中断的构建不会留下半个索引。
+                    """, "test-model");
+            panel.set(created);
+        });
+        int before = panel.get().latestAnswerPane().getPreferredSize().height;
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                Theme.contentScale(150);
+                panel.get().applyContentScale();
+            });
+            int after = panel.get().latestAnswerPane().getPreferredSize().height;
+
+            assertTrue(after > before, "150% has to be taller than 100%: " + before + " -> " + after);
+            assertTrue(panel.get().latestAnswerRowHeight() >= after,
+                    "the row keeps its old cap and clips the answer: "
+                            + panel.get().latestAnswerRowHeight() + " for " + after);
+        } finally {
+            SwingUtilities.invokeAndWait(() -> {
+                Theme.contentScale(100);
+                panel.get().applyContentScale();
+            });
+        }
+    }
+
     private static String rendered(AskPanel panel) throws Exception {
         MarkdownPane pane = panel.latestAnswerPane();
         return pane.getDocument().getText(0, pane.getDocument().getLength());

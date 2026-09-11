@@ -8,9 +8,13 @@ import com.simplerag.application.dto.FileContentView;
 import com.simplerag.application.dto.FileNodeView;
 import com.simplerag.application.dto.IndexBuildProgress;
 import com.simplerag.application.dto.IndexBuildResult;
+import com.simplerag.application.dto.LocalModelView;
+import com.simplerag.application.dto.ModelDownloadProgress;
 import com.simplerag.application.dto.SearchResultView;
 import com.simplerag.application.dto.RemoteSendReview;
+import com.simplerag.application.dto.WorkspaceLayout;
 import com.simplerag.application.diagnostics.DiagnosticReportService;
+import com.simplerag.application.port.in.ManageWorkspaceLayout;
 import com.simplerag.model.KnowledgeBase;
 import com.simplerag.model.KnowledgeStats;
 import com.simplerag.model.TokenUsage;
@@ -20,19 +24,27 @@ import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
+import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
+import javax.swing.JSplitPane;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.KeyStroke;
 import javax.swing.Timer;
 import java.awt.Component;
 import java.awt.Dimension;
+import java.awt.Frame;
+import java.awt.GraphicsDevice;
+import java.awt.GraphicsEnvironment;
+import java.awt.Rectangle;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.ActionEvent;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.awt.event.KeyEvent;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -49,6 +61,7 @@ public final class DesktopWorkspaceController {
     private final FileBrowserController browser;
     private final BackgroundTaskCoordinator tasks;
     private final DesktopFileGateway files;
+    private final ManageWorkspaceLayout layout;
     private final Consumer<KnowledgeBase> activeKnowledgeChanged;
     private final Runnable showFilePage;
     private final StatusBar statusBar = new StatusBar();
@@ -62,16 +75,23 @@ public final class DesktopWorkspaceController {
     private final Timer searchTimer;
     private final Timer statusResetTimer;
     private final Timer freshnessTimer;
+    private final Timer layoutSaveTimer;
     private BackgroundTaskCoordinator.TaskHandle searchTask;
     private BackgroundTaskCoordinator.TaskHandle highlightTask;
     private BackgroundTaskCoordinator.TaskHandle askTask;
     private BackgroundTaskCoordinator.TaskHandle previewTask;
+    private BackgroundTaskCoordinator.TaskHandle modelTask;
     /** Identity the bubbles on screen were produced under; drives the context-break marker. */
     private KnowledgeController.TaskIdentity conversationIdentity;
+    private JFrame window;
+    private JSplitPane sidebarSplit;
+    /** Bounds to restore to. A maximized window reports the screen, which is not worth saving. */
+    private Rectangle normalBounds;
 
     public DesktopWorkspaceController(KnowledgeController knowledge, SearchController search, AskController ask,
                                       FileBrowserController browser, BackgroundTaskCoordinator tasks,
-                                      DesktopFileGateway files, Consumer<KnowledgeBase> activeKnowledgeChanged,
+                                      DesktopFileGateway files, ManageWorkspaceLayout layout,
+                                      Consumer<KnowledgeBase> activeKnowledgeChanged,
                                       Runnable showFilePage, DiagnosticReportService diagnostics) {
         this.knowledge = knowledge;
         this.search = search;
@@ -79,11 +99,13 @@ public final class DesktopWorkspaceController {
         this.browser = browser;
         this.tasks = tasks;
         this.files = files;
+        this.layout = layout;
         this.activeKnowledgeChanged = activeKnowledgeChanged;
         this.showFilePage = showFilePage;
         this.askPanel = new AskPanel(this::askQuestion, this::saveLocalPolicy,
                 this::openCitation, this::clearConversation);
-        this.settingsPanel = new SettingsPanel(this::saveApiSettings, this::fetchModels);
+        this.settingsPanel = new SettingsPanel(this::saveApiSettings, this::fetchModels,
+                this::downloadLocalModel);
         this.searchPanel = new SearchPanel(this::scheduleSearch, this::setPreview,
                 this::openSelectedFile, this::openSelectedDirectory, this::copySelectedChunk,
                 this::openSelectedResultInApp);
@@ -100,8 +122,12 @@ public final class DesktopWorkspaceController {
         this.freshnessTimer = new Timer(1000, event -> refreshFreshnessStatus());
         freshnessTimer.setCoalesce(true);
         freshnessTimer.start();
+        // Dragging a window fires hundreds of events; only the arrangement it settles on is worth a write.
+        this.layoutSaveTimer = new Timer(800, event -> saveLayout());
+        layoutSaveTimer.setRepeats(false);
         installQuestionShortcut();
         settingsPanel.configs(ask.config(), ask.embeddingConfig(), ask.rerankConfig());
+        refreshLocalModel();
         refreshAll();
         setPreview(null);
     }
@@ -125,7 +151,95 @@ public final class DesktopWorkspaceController {
     }
 
     public void close() {
-        freshnessTimer.stop(); searchTimer.stop(); statusResetTimer.stop(); clearTasks();
+        freshnessTimer.stop(); searchTimer.stop(); statusResetTimer.stop();
+        layoutSaveTimer.stop(); saveLayout();
+        clearTasks();
+        if (modelTask != null && !modelTask.isDone()) modelTask.cancel();
+    }
+
+    /**
+     * Puts the window back where it was last closed and keeps watching it.
+     *
+     * <p>Saved bounds are only trusted when they still land on a screen that exists: a window restored
+     * onto a monitor that has since been unplugged is one the user cannot reach or move.
+     */
+    public void restoreWindow(JFrame frame, JSplitPane split) {
+        this.window = frame;
+        this.sidebarSplit = split;
+        WorkspaceLayout saved = layout.workspaceLayout();
+        Theme.contentScale(saved.contentScale());
+        applyContentScale();
+        split.setDividerLocation(Math.max(200, Math.min(640, saved.sidebarWidth())));
+        Rectangle bounds = new Rectangle(saved.x(), saved.y(), saved.width(), saved.height());
+        if (saved.placed() && reachable(bounds)) {
+            frame.setBounds(bounds);
+        } else {
+            frame.setSize(Math.max(1120, saved.width()), Math.max(680, saved.height()));
+            frame.setLocationRelativeTo(null);
+        }
+        normalBounds = frame.getBounds();
+        if (saved.maximized()) frame.setExtendedState(Frame.MAXIMIZED_BOTH);
+        frame.addComponentListener(new ComponentAdapter() {
+            @Override public void componentResized(ComponentEvent event) { windowChanged(); }
+            @Override public void componentMoved(ComponentEvent event) { windowChanged(); }
+        });
+        split.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY,
+                event -> layoutSaveTimer.restart());
+    }
+
+    /**
+     * Reading size for the answer transcript, the chunk preview and the file page.
+     *
+     * @param deltaPercent step to apply, or {@code 0} to go back to the design size
+     */
+    public void zoomContent(int deltaPercent) {
+        int previous = Theme.contentScale();
+        Theme.contentScale(deltaPercent == 0
+                ? WorkspaceLayout.DEFAULT_CONTENT_SCALE : previous + deltaPercent);
+        if (Theme.contentScale() == previous) {
+            if (deltaPercent != 0) flashStatus("正文字号已到上限或下限：" + previous + "%");
+            return;
+        }
+        applyContentScale();
+        flashStatus("正文字号 " + Theme.contentScale() + "%  ·  Ctrl+0 恢复默认");
+        layoutSaveTimer.restart();
+    }
+
+    private void applyContentScale() {
+        askPanel.applyContentScale();
+        searchPanel.applyContentScale();
+        viewerPanel.applyContentScale();
+    }
+
+    private void windowChanged() {
+        if (window != null && !maximized()) normalBounds = window.getBounds();
+        layoutSaveTimer.restart();
+    }
+
+    private boolean maximized() {
+        return window != null
+                && (window.getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH;
+    }
+
+    private void saveLayout() {
+        if (window == null) return;
+        Rectangle bounds = normalBounds == null ? window.getBounds() : normalBounds;
+        int divider = sidebarSplit == null
+                ? WorkspaceLayout.DEFAULT_SIDEBAR_WIDTH : sidebarSplit.getDividerLocation();
+        try {
+            layout.saveWorkspaceLayout(new WorkspaceLayout(bounds.x, bounds.y, bounds.width,
+                    bounds.height, maximized(), divider, Theme.contentScale()));
+        } catch (RuntimeException unwritable) {
+            // Losing the arrangement is not worth interrupting a shutdown or a window drag over.
+        }
+    }
+
+    private static boolean reachable(Rectangle bounds) {
+        for (GraphicsDevice device : GraphicsEnvironment.getLocalGraphicsEnvironment().getScreenDevices()) {
+            Rectangle visible = device.getDefaultConfiguration().getBounds().intersection(bounds);
+            if (visible.width >= 240 && visible.height >= 120) return true;
+        }
+        return false;
     }
 
     private void installQuestionShortcut() {
@@ -297,8 +411,56 @@ public final class DesktopWorkspaceController {
         }
         catch (RuntimeException failure) { showError("无法保存 API 配置", failure); }
     }
-    private void fetchModels(SettingsPanel.ModelKind kind, JButton button) {
-        ApiConfig config = switch (kind) {
+    private void refreshLocalModel() { settingsPanel.localModel(knowledge.localModel()); }
+
+    /**
+     * Installs the local embedding model from the settings page.
+     *
+     * <p>Not bound to a knowledge base: the model belongs to the installation, so switching bases or
+     * rebuilding an index while it downloads must not discard it. Cancellation happens only on close.
+     */
+    private void downloadLocalModel() {
+        if (modelTask != null && !modelTask.isDone()) return;
+        settingsPanel.modelDownloading("正在连接镜像…", -1);
+        flashStatus("正在下载本地语义模型…");
+        modelTask = tasks.<LocalModelView, ModelDownloadProgress>submit(null, null,
+                knowledge::installLocalModel,
+                reports -> {
+                    ModelDownloadProgress latest = reports.get(reports.size() - 1);
+                    settingsPanel.modelDownloading(describe(latest), latest.percent());
+                },
+                view -> {
+                    settingsPanel.localModel(view);
+                    refreshSourcesAndStats();
+                    boolean ready = view.installed();
+                    settingsPanel.status(ready
+                                    ? "本地语义模型已就绪 · 重建索引后语义检索才会生效"
+                                    : "下载结束，但模型文件仍不完整，请重试",
+                            ready ? Theme.ACCENT : Theme.RED);
+                    flashStatus(ready ? "语义模型下载完成，请重建索引" : "语义模型仍不完整");
+                },
+                failure -> {
+                    refreshLocalModel();
+                    settingsPanel.status("模型下载失败：" + reason(failure), Theme.RED);
+                    flashStatus("语义模型下载失败");
+                },
+                () -> { refreshLocalModel(); flashStatus("语义模型下载已取消"); });
+    }
+
+    private static String describe(ModelDownloadProgress progress) {
+        String size = progress.totalBytes() > 0
+                ? FileStatusStyle.size(progress.bytes()) + " / " + FileStatusStyle.size(progress.totalBytes())
+                : FileStatusStyle.size(progress.bytes());
+        return "正在下载 " + progress.file() + "（" + progress.fileIndex() + "/" + progress.fileCount()
+                + "） · " + size;
+    }
+
+    private static String reason(Throwable failure) {
+        String message = failure.getMessage();
+        return message == null || message.isBlank() ? failure.getClass().getSimpleName() : message;
+    }
+
+    private void fetchModels(SettingsPanel.ModelKind kind, JButton button) {        ApiConfig config = switch (kind) {
             case CHAT -> settingsPanel.chatConfig();
             case EMBEDDING -> settingsPanel.embeddingConfig().asApiConfig();
             case RERANK -> settingsPanel.rerankConfig().asApiConfig();

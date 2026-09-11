@@ -38,6 +38,8 @@ import java.util.function.Consumer;
 public final class FileViewerPanel extends JPanel {
     /** Same green the search page paints semantic hits with, so "located" reads the same everywhere. */
     private static final Color FOCUS = new Color(38, 104, 83);
+    /** Design size of the extracted text, which follows the reading scale. */
+    private static final float BODY_SIZE = 13f;
 
     private final JLabel title = new JLabel("选择一个文件");
     private final JLabel location = new JLabel(" ");
@@ -64,6 +66,12 @@ public final class FileViewerPanel extends JPanel {
     }
 
     public FileNodeView selected() { return current; }
+
+    /** Redraws the extracted text at the current reading scale; the gutter has to match line for line. */
+    public void applyContentScale() {
+        body.setFont(Theme.contentFont(Theme.MONO_FONT, BODY_SIZE));
+        gutter.setFont(Theme.contentFont(Theme.MONO_FONT, BODY_SIZE));
+    }
 
     /**
      * Package-private views for panel tests; the workspace controller drives this page through its
@@ -308,14 +316,14 @@ public final class FileViewerPanel extends JPanel {
 
     private JScrollPane buildBody() {
         body.setEditable(false);
-        body.setFont(Theme.MONO_FONT);
+        body.setFont(Theme.contentFont(Theme.MONO_FONT, BODY_SIZE));
         body.setBackground(Theme.PANEL_ALT);
         body.setForeground(new Color(218, 226, 230));
         body.setCaretColor(Theme.ACCENT);
         body.setTabSize(4);
         body.setBorder(Theme.padding(10, 10, 10, 10));
         gutter.setEditable(false);
-        gutter.setFont(Theme.MONO_FONT);
+        gutter.setFont(Theme.contentFont(Theme.MONO_FONT, BODY_SIZE));
         gutter.setBackground(Theme.PANEL);
         gutter.setForeground(new Color(104, 116, 124));
         gutter.setBorder(Theme.padding(10, 8, 10, 8));

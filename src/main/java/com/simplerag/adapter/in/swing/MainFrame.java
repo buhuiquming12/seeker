@@ -2,10 +2,12 @@ package com.simplerag.adapter.in.swing;
 
 import com.simplerag.model.KnowledgeBase;
 import com.simplerag.application.diagnostics.DiagnosticReportService;
+import com.simplerag.application.port.in.ManageWorkspaceLayout;
 
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JComponent;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -41,19 +43,21 @@ public final class MainFrame extends JFrame {
     private final JButton diagnosticMode = new JButton("诊断信息");
     private final JButton settingsMode = new JButton("设置");
     private final DesktopWorkspaceController workspace;
+    /** Sidebar divider, kept as a field because its position is part of the restored arrangement. */
+    private JSplitPane split;
 
     public MainFrame(KnowledgeController knowledge, SearchController search, AskController ask,
                      FileBrowserController browser, BackgroundTaskCoordinator tasks,
-                     DesktopFileGateway files, DiagnosticReportService diagnostics) {
+                     DesktopFileGateway files, ManageWorkspaceLayout layout,
+                     DiagnosticReportService diagnostics) {
         super("SimpleRAG - 本地语义知识库");
         this.workspace = new DesktopWorkspaceController(knowledge, search, ask, browser, tasks, files,
-                this::showCurrentKnowledge, () -> showMode(FILE_MODE), diagnostics);
+                layout, this::showCurrentKnowledge, () -> showMode(FILE_MODE), diagnostics);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(1120, 680));
-        setSize(1440, 860);
-        setLocationRelativeTo(null);
         setContentPane(buildContent());
         installNavigation();
+        workspace.restoreWindow(this, split);
         addWindowListener(new WindowAdapter() {
             @Override public void windowClosing(WindowEvent event) { workspace.close(); }
         });
@@ -96,8 +100,8 @@ public final class MainFrame extends JFrame {
         modeCards.add(workspace.fileViewerPanel(), FILE_MODE);
         modeCards.add(workspace.diagnosticPanel(), DIAGNOSTIC_MODE);
         modeCards.add(workspace.settingsPanel(), SETTINGS_MODE);
-        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, workspace.knowledgePanel(), modeCards);
-        split.setDividerLocation(300); split.setDividerSize(1); split.setResizeWeight(0); split.setBorder(null); split.setBackground(Theme.BORDER);
+        split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, workspace.knowledgePanel(), modeCards);
+        split.setDividerSize(1); split.setResizeWeight(0); split.setBorder(null); split.setBackground(Theme.BORDER);
         return split;
     }
 
@@ -107,10 +111,28 @@ public final class MainFrame extends JFrame {
         fileMode.addActionListener(event -> showMode(FILE_MODE));
         diagnosticMode.addActionListener(event -> { workspace.diagnosticPanel().refresh(); showMode(DIAGNOSTIC_MODE); });
         settingsMode.addActionListener(event -> showMode(SETTINGS_MODE));
-        getRootPane().getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_K,
-                Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()), "focusSearch");
-        getRootPane().getActionMap().put("focusSearch", new javax.swing.AbstractAction() {
-            @Override public void actionPerformed(ActionEvent event) { showMode(SEARCH_MODE); workspace.focusSearch(); }
+        shortcut(KeyEvent.VK_K, "focusSearch", () -> { showMode(SEARCH_MODE); workspace.focusSearch(); });
+        // Both rows of +/- keys, because which one a keyboard reports depends on the layout.
+        for (int key : new int[]{KeyEvent.VK_EQUALS, KeyEvent.VK_PLUS, KeyEvent.VK_ADD}) {
+            shortcut(key, "zoomIn" + key, () -> workspace.zoomContent(10));
+        }
+        for (int key : new int[]{KeyEvent.VK_MINUS, KeyEvent.VK_SUBTRACT}) {
+            shortcut(key, "zoomOut" + key, () -> workspace.zoomContent(-10));
+        }
+        for (int key : new int[]{KeyEvent.VK_0, KeyEvent.VK_NUMPAD0}) {
+            shortcut(key, "zoomReset" + key, () -> workspace.zoomContent(0));
+        }
+    }
+
+    /**
+     * Window-wide shortcut. Bound on the ancestor map rather than the root pane's own focus map, which
+     * only fires while the root pane itself holds focus - something that effectively never happens.
+     */
+    private void shortcut(int keyCode, String name, Runnable action) {
+        getRootPane().getInputMap(JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT).put(
+                KeyStroke.getKeyStroke(keyCode, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()), name);
+        getRootPane().getActionMap().put(name, new javax.swing.AbstractAction() {
+            @Override public void actionPerformed(ActionEvent event) { action.run(); }
         });
     }
 

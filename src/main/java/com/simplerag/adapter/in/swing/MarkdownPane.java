@@ -46,6 +46,8 @@ final class MarkdownPane extends JTextPane {
     private boolean markdown;
     private boolean error;
     private boolean pending;
+    /** A zoom re-renders every pane at once; the page re-measures them itself afterwards. */
+    private boolean rescaling;
     MarkdownPane(Color foreground, Color selection, Color selectedText, IntConsumer onCitation,
                  Runnable onRendered) {
         this.textColor = foreground;
@@ -57,7 +59,7 @@ final class MarkdownPane extends JTextPane {
         setOpaque(false);
         setBorder(null);
         setFocusable(true);
-        setFont(Theme.UI_FONT.deriveFont((float) BASE_SIZE));
+        setFont(Theme.UI_FONT.deriveFont(Theme.contentSize(BASE_SIZE)));
         setForeground(foreground);
         setSelectionColor(selection);
         setSelectedTextColor(selectedText);
@@ -95,6 +97,22 @@ final class MarkdownPane extends JTextPane {
     }
 
     /**
+     * Re-renders at the current reading scale. Deliberately silent: a zoom touches every bubble on the
+     * page, and letting each one ask the transcript to re-measure and scroll would drag the reader to
+     * the bottom of a conversation they were reading the middle of.
+     */
+    void rescale() {
+        setFont(Theme.UI_FONT.deriveFont(Theme.contentSize(BASE_SIZE)));
+        coalesce.stop();
+        rescaling = true;
+        try {
+            render();
+        } finally {
+            rescaling = false;
+        }
+    }
+
+    /**
      * The transcript owns scrolling. Without this a re-render mid-stream would drag the view back to
      * this bubble's caret and fight the scroll-to-bottom the page just did.
      */
@@ -111,7 +129,7 @@ final class MarkdownPane extends JTextPane {
         } catch (BadLocationException unexpected) {
             setText(source);
         }
-        if (onRendered != null) onRendered.run();
+        if (onRendered != null && !rescaling) onRendered.run();
     }
 
     private void write(StyledDocument document, MarkdownText text) throws BadLocationException {
@@ -157,7 +175,8 @@ final class MarkdownPane extends JTextPane {
         switch (line.block()) {
             case HEADING -> {
                 StyleConstants.setBold(attributes, true);
-                StyleConstants.setFontSize(attributes, Math.max(BASE_SIZE, 17 - line.level()));
+                StyleConstants.setFontSize(attributes,
+                        Math.round(Theme.contentSize(Math.max(BASE_SIZE, 17 - line.level()))));
             }
             case QUOTE -> {
                 StyleConstants.setForeground(attributes, error ? Theme.RED : Theme.MUTED);
@@ -170,7 +189,7 @@ final class MarkdownPane extends JTextPane {
     private SimpleAttributeSet plain(boolean bold, boolean italic) {
         SimpleAttributeSet attributes = new SimpleAttributeSet();
         StyleConstants.setFontFamily(attributes, Theme.UI_FONT.getFamily());
-        StyleConstants.setFontSize(attributes, BASE_SIZE);
+        StyleConstants.setFontSize(attributes, Math.round(Theme.contentSize(BASE_SIZE)));
         StyleConstants.setForeground(attributes, error ? Theme.RED : textColor);
         StyleConstants.setBold(attributes, bold);
         StyleConstants.setItalic(attributes, italic);
@@ -180,7 +199,7 @@ final class MarkdownPane extends JTextPane {
     private SimpleAttributeSet code() {
         SimpleAttributeSet attributes = new SimpleAttributeSet();
         StyleConstants.setFontFamily(attributes, MONO_FAMILY);
-        StyleConstants.setFontSize(attributes, CODE_SIZE);
+        StyleConstants.setFontSize(attributes, Math.round(Theme.contentSize(CODE_SIZE)));
         StyleConstants.setForeground(attributes, error ? Theme.RED : CODE_TEXT);
         StyleConstants.setBackground(attributes, CODE_BACKGROUND);
         return attributes;

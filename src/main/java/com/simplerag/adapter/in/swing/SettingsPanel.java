@@ -1,5 +1,6 @@
 package com.simplerag.adapter.in.swing;
 
+import com.simplerag.application.dto.LocalModelView;
 import com.simplerag.rag.ApiConfig;
 import com.simplerag.rag.ModelApiConfig;
 
@@ -12,6 +13,7 @@ import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
+import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
 import java.awt.BorderLayout;
@@ -25,14 +27,18 @@ import java.util.List;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
-/** Central settings page for chat, embedding and reranking APIs. */
+/** Central settings page for the local model and the chat, embedding and reranking APIs. */
 public final class SettingsPanel extends JPanel {
     private final ApiFields chat = new ApiFields(false, false);
     private final ApiFields embedding = new ApiFields(true, true);
     private final ApiFields rerank = new ApiFields(true, false);
     private final JLabel status = new JLabel("API Key 会加密保存，不会写入索引或诊断日志");
+    private final JLabel modelStatus = new JLabel("正在检查本地语义模型…");
+    private final JProgressBar modelProgress = new JProgressBar();
+    private final JButton downloadModel = new JButton("下载模型");
 
-    public SettingsPanel(Runnable onSave, BiConsumer<ModelKind, JButton> onFetchModels) {
+    public SettingsPanel(Runnable onSave, BiConsumer<ModelKind, JButton> onFetchModels,
+                         Runnable onDownloadModel) {
         super(new BorderLayout());
         Theme.opaque(this, Theme.BACKGROUND);
         JPanel body = new JPanel();
@@ -41,6 +47,8 @@ public final class SettingsPanel extends JPanel {
         body.setBorder(Theme.padding(24, 28, 28, 28));
         body.add(header());
         body.add(Box.createVerticalStrut(18));
+        body.add(localModelSection(onDownloadModel));
+        body.add(Box.createVerticalStrut(14));
         body.add(section("对话模型", "用于知识问答、流式生成与追加检索决策", chat,
                 ModelKind.CHAT, onFetchModels));
         body.add(Box.createVerticalStrut(14));
@@ -100,6 +108,36 @@ public final class SettingsPanel extends JPanel {
         status.setForeground(color);
     }
 
+    /**
+     * Reports the local model as it is on disk and puts the page back into an idle state, so the same
+     * call ends a download whether it succeeded or failed.
+     */
+    public void localModel(LocalModelView view) {
+        modelProgress.setVisible(false);
+        modelProgress.setIndeterminate(false);
+        downloadModel.setEnabled(true);
+        downloadModel.setText(view.installed() ? "重新下载" : "下载模型");
+        modelStatus.setForeground(view.installed() ? Theme.ACCENT : Theme.AMBER);
+        modelStatus.setText((view.installed()
+                ? "已安装 · " + FileStatusStyle.size(view.bytes()) + " · " + view.modelName()
+                : "未安装 · 本地语义检索不可用，只能按关键词匹配")
+                + "  ·  " + view.directory());
+    }
+
+    /** One step of an in-flight download; {@code percent} below zero means the size is unknown. */
+    public void modelDownloading(String text, int percent) {
+        downloadModel.setEnabled(false);
+        modelProgress.setVisible(true);
+        modelProgress.setIndeterminate(percent < 0);
+        if (percent >= 0) modelProgress.setValue(percent);
+        modelStatus.setForeground(Theme.TEXT);
+        modelStatus.setText(text);
+    }
+
+    String modelStatusText() { return modelStatus.getText(); }
+
+    boolean downloadEnabled() { return downloadModel.isEnabled(); }
+
     private ApiFields fields(ModelKind kind) {
         return switch (kind) {
             case CHAT -> chat;
@@ -125,9 +163,64 @@ public final class SettingsPanel extends JPanel {
         return panel;
     }
 
+    /**
+     * The local ONNX model, installable from here.
+     *
+     * <p>It used to be reachable only by finding and running {@code setup-semantic-model.cmd}, which
+     * left the application saying semantic search was unavailable without saying what to do about it.
+     */
+    private JPanel localModelSection(Runnable onDownload) {
+        JPanel panel = new JPanel(new BorderLayout(0, 10));
+        Theme.opaque(panel, Theme.PANEL);
+        panel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Theme.BORDER), Theme.padding(16, 18, 17, 18)));
+        panel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 132));
+
+        JPanel labels = new JPanel();
+        labels.setOpaque(false);
+        labels.setLayout(new BoxLayout(labels, BoxLayout.Y_AXIS));
+        JLabel title = new JLabel("本地语义模型");
+        title.setForeground(Theme.TEXT);
+        title.setFont(Theme.UI_FONT.deriveFont(Font.BOLD, 15f));
+        JLabel hint = new JLabel("关闭远程向量 API 时由它生成向量；约 120 MB，下载后需要重建索引");
+        hint.setForeground(Theme.MUTED);
+        hint.setFont(Theme.UI_FONT.deriveFont(11f));
+        labels.add(title);
+        labels.add(Box.createVerticalStrut(3));
+        labels.add(hint);
+
+        JPanel heading = new JPanel(new BorderLayout(12, 0));
+        heading.setOpaque(false);
+        heading.add(labels, BorderLayout.CENTER);
+        Theme.styleButton(downloadModel, true);
+        downloadModel.setToolTipText("从 HF_ENDPOINT 指定的镜像下载；再次点击可覆盖已有文件");
+        downloadModel.addActionListener(event -> onDownload.run());
+        heading.add(downloadModel, BorderLayout.EAST);
+        panel.add(heading, BorderLayout.NORTH);
+
+        JPanel state = new JPanel();
+        state.setOpaque(false);
+        state.setLayout(new BoxLayout(state, BoxLayout.Y_AXIS));
+        modelStatus.setFont(Theme.UI_FONT.deriveFont(11f));
+        modelStatus.setForeground(Theme.MUTED);
+        modelStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
+        modelProgress.setMaximum(100);
+        modelProgress.setVisible(false);
+        modelProgress.setForeground(Theme.ACCENT);
+        modelProgress.setBackground(Theme.BORDER);
+        modelProgress.setAlignmentX(Component.LEFT_ALIGNMENT);
+        modelProgress.setMaximumSize(new Dimension(Integer.MAX_VALUE, 6));
+        modelProgress.setPreferredSize(new Dimension(240, 6));
+        state.add(modelStatus);
+        state.add(Box.createVerticalStrut(8));
+        state.add(modelProgress);
+        panel.add(state, BorderLayout.CENTER);
+        return panel;
+    }
+
     private JPanel section(String titleText, String hintText, ApiFields fields, ModelKind kind,
-                           BiConsumer<ModelKind, JButton> onFetch) {
-        JPanel panel = new JPanel(new BorderLayout(0, 12));
+                           BiConsumer<ModelKind, JButton> onFetch) {        JPanel panel = new JPanel(new BorderLayout(0, 12));
         Theme.opaque(panel, Theme.PANEL);
         panel.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(Theme.BORDER), Theme.padding(16, 18, 17, 18)));
