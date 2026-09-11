@@ -40,7 +40,7 @@ IndexFormatVersion
 
 ## 3. 数据模型与 migration
 
-`DatabaseManager` 维护 `schema_version`，migration 在事务中按顺序执行。当前 schema 为版本 3。
+`DatabaseManager` 维护 `schema_version`，migration 在事务中按顺序执行。当前 schema 为版本 4。版本 4 新增 `conversation` 与 `conversation_message`：对话归属于知识库，消息归属于对话；两级外键均使用 `ON DELETE CASCADE`。消息保存 role、正文、顺序、时间和生成时的 `source_revision`。
 
 `knowledge_base` 新增：
 
@@ -226,7 +226,7 @@ proof knowledgeBaseId/sourceRevision == 当前任务
 
 任一条件不满足都抛出本地错误。`AskUseCase` 在召回前检查一次，并在 citations 准备完成、调用 `ChatModel` 前再次检查，缩小异步文件事件期间的发送窗口。`DIRTY`、`BUILDING`、`FAILED`、`INCOMPATIBLE`、`VERIFYING`、`UNAVAILABLE` 和 `STOPPED` 状态不会静默使用旧片段调用远程 API。
 
-允许调用时只发送最多 6 个召回片段的路径、行号、内容和用户问题，不发送整个知识库。API Key 使用 AES-GCM 加密存储；其安全级别是应用级本地保护，不是操作系统凭据保险库。
+首轮最多召回 6 个片段；经过最多 3 个追加规划轮后，去重上下文总上限为 12 个片段。首次远程发送前需要用户授权，后续规划轮新增的片段会更新引用范围但不重复弹窗；任何远程调用前仍重新执行 freshness gate。Windows 上 API Key 首选保存到当前用户的 Windows Credential Manager，SQLite 只保留 marker；AES-GCM 仅用于存量兼容或 Credential Manager 不可用时的 fallback。
 
 多轮对话由独立的 `application.conversation` 模块管理（见第 17 节）。每一轮问答都会重新执行 freshness 检查与知识检索；对话历史只保留 user/assistant 文本，不会沿用上一轮的引用片段。失败或用户取消的轮次不会写入会话历史。
 
@@ -257,12 +257,16 @@ com.simplerag
 │  │  ├─ RebuildKnowledgeIndex
 │  │  ├─ SearchKnowledge
 │  │  ├─ AskKnowledge
+│  │  ├─ ManageConversations
 │  │  ├─ ManageApiSettings
+│  │  ├─ InstallLocalModel
+│  │  ├─ ManageWorkspaceLayout
 │  │  └─ DesktopReadModel
 │  ├─ port.out
 │  │  ├─ KnowledgeBaseRepository
 │  │  ├─ SettingsRepository
 │  │  ├─ IndexRepository
+│  │  ├─ ConversationRepository / EmbeddingModelStore
 │  │  ├─ TextEmbedder
 │  │  ├─ ChatModel
 │  │  ├─ SecretStore
@@ -270,7 +274,8 @@ com.simplerag
 │  ├─ conversation
 │  │  ├─ ChatMessage / ChatRequest
 │  │  ├─ ConversationContext / ConversationSession
-│  │  └─ ConversationStore（内存会话，按 knowledgeBaseId 索引）
+│  │  ├─ ConversationRepository（SQLite 完整 transcript）
+│  │  └─ ConversationStore（按 conversationId + sourceRevision 缓存模型可见历史）
 │  ├─ freshness
 │  │  ├─ SourceFingerprint / FreshnessSnapshot
 │  │  └─ FreshnessGate
@@ -287,7 +292,10 @@ com.simplerag
 │     └─ ApiSettingsUseCase / DesktopQueryService
 ├─ adapter.in.swing
 │  ├─ MainFrame
-│  ├─ DesktopWorkspaceController（页面工作流协调）
+│  ├─ DesktopWorkspaceController（页面组合）
+│  ├─ ConversationCoordinator（问答与持久化对话）
+│  ├─ ModelSettingsCoordinator（API 与本地模型）
+│  ├─ WorkspaceLayoutCoordinator（窗口、侧栏与字号）
 │  ├─ KnowledgePanel / SearchPanel / AskPanel / StatusBar
 │  ├─ BackgroundTaskCoordinator / DesktopFileGateway
 │  ├─ KnowledgeController
@@ -332,6 +340,8 @@ LangChain4j 的传递依赖提供 Java ONNX Runtime 和 DJL Hugging Face tokeniz
 ```powershell
 .\setup-semantic-model.cmd
 ```
+
+设置页也可以调用同一个 `ModelDownloader` 安装或重新下载模型，并显示由 Content-Length 驱动的进度。下载完成后 `Langchain4jOnnxEmbeddingProvider.reload()` 清除模型、状态和签名缓存，因此无需重启；已有索引仍必须重建。下载使用 `.part` 临时文件，异常或取消时删除临时文件。
 
 ## 12. 检索与高亮
 
@@ -431,7 +441,6 @@ CourseFeaturesTest: knowledge-base CRUD and RAG API checks passed
 - 当前 watcher/reconciliation 只监控本机当前活动知识库；切换到其他知识库时会重新加载索引并执行完整身份校验。
 - API Key 尚未接入 Windows Credential Manager。
 - `KnowledgeService` 仍保留兼容 facade，供既有命令行回归和构建流程复用；生产桌面组合中的搜索、问答和 API 设置已经直接装配独立用例。
-- 多轮对话会话仅保存在内存（`ConversationStore`），应用退出后不会恢复；SQLite 持久化按计划单独提交。
 
 ## 15. 第二阶段结构稳定化结果
 
@@ -471,10 +480,9 @@ SettingsRepository
 
 生产环境仍由同一 `AppRepository` 聚合实现，并通过 `SqliteTransactionManager` 执行跨表事务。添加/删除 source 与 revision/`DIRTY` 更新不能部分提交；索引 manifest 与发布指针仍在同一条件事务内发布。
 
-### 15.4 架构决策与追踪
+### 15.4 架构边界与验证
 
-- ADR 位于 [`docs/adr`](docs/adr)。
-- 工程问题、实现类和自动化证据位于 [`docs/REQUIREMENTS_TRACEABILITY.md`](docs/REQUIREMENTS_TRACEABILITY.md)。
+- 当前架构与实现边界以本文档为准。
 - `ArchitectureTest` 固定三层依赖、Swing DTO 边界、用例隔离、检索策略依赖和 `SwingWorker` 所有权。
 
 ## 16. 第三阶段增量索引结果
@@ -503,28 +511,29 @@ watcher 确认外部文件变化时条件递增 `source_revision`；对已经 `R
 - 知识问答页改为接近主流产品的聊天气泡 UI（用户右对齐、助手左对齐）。
 - 继续修气泡布局：消息行按内容高度收缩，长回答按聊天列宽铺开，消除 BoxLayout 纵向拉伸造成的大片留白。
 
-### 17.2 多轮对话模块（内存）
+### 17.2 持久化 transcript 与 revision 绑定的模型会话
 
-新增包 `application.conversation`：
+`application.conversation` 与 SQLite repository 共同管理对话：
 
 | 类型 | 职责 |
 | --- | --- |
 | `ChatMessage` | user/assistant/system 消息值对象；估算 token（粗估 chars/4） |
-| `ConversationSession` | 单会话历史；绑定 `knowledgeBaseId + sourceRevision` |
-| `ConversationContext` | 裁剪策略：默认最多 12 轮、约 3000 token |
-| `ConversationStore` | 按知识库索引的内存会话表；revision 变化时替换会话 |
+| `ConversationSession` | 单次模型会话历史；绑定 `conversationId + sourceRevision` |
+| `ConversationContext` | 裁剪策略：最近 12 条消息、约 3000 token |
+| `ConversationStore` | 按 `conversationId + sourceRevision` 缓存模型当前可见历史 |
+| `ConversationRepository` | 在 SQLite 保存完整对话列表和 transcript |
 | `ChatRequest` | 不可变出站请求：当前问题 + 历史 + **本轮** citations |
 
 不变量与边界：
 
-- 历史绑定 `knowledgeBaseId + sourceRevision`；切换知识库或 revision 变化会打开新会话，旧历史不可复用。
+- 完整 transcript 跨 revision 保存在 SQLite；切换 revision 不删除历史。
+- 提供给模型的历史只取当前 `sourceRevision`，revision 变化处会形成新的上下文边界。
 - 历史只保留 user/assistant 文本，**不保留**引用片段或文件路径上下文。
 - 每一轮 `AskUseCase` 仍重新做 freshness 检查与知识检索；历史不得重新引入旧 citations。
-- 默认预算：最多 12 轮、约 3000 token（粗估 chars/4）；超出时从最旧完整 user 轮次裁剪。
-- 失败轮次与用户取消不写入历史；成功后才 `appendUser` / `appendAssistant`。
-- `ConversationStore` 明确不写 SQLite（本阶段按产品要求单独提交持久化）。
+- 默认预算：最近 12 条消息、约 3000 token（粗估 chars/4），超出时从最旧完整 user 轮次裁剪。
+- 失败轮次与用户取消不写入数据库；成功后才持久化 user/assistant 消息。
 
-`AskController` 在流式问答前快照 `historyForRequest`，成功回调时再次确认 store 仍持有同一 session 对象后再提交轮次，避免知识库切换竞态把回答写进错误会话。
+`AskController` 在流式问答前快照 `historyForRequest`，成功回调时再次确认 store 仍持有同一 session 对象后再提交轮次，避免知识库、对话或 revision 切换竞态把回答写进错误会话。
 
 ### 17.3 问答页气泡 UI（`AskPanel`）
 
@@ -545,7 +554,7 @@ API 配置条
 
 - Enter 发送，Shift+Enter 换行；生成中按钮切换为「停止」。
 - 右侧「本轮引用」侧栏只展示当前轮 citations；历史不沿用旧片段。
-- 切换知识库 / revision 变化后，会话 UI 同步清空或切换到新 session。
+- 切换知识库 / revision 后，完整 transcript 仍保留；模型会话切换到对应 revision 的上下文，UI 显示上下文分隔线。
 - 流式 delta 追加到助手气泡；失败气泡标红，且不进入多轮历史。
 
 布局修复（消除大片留白）：
@@ -973,3 +982,27 @@ JUnit/ArchUnit 共 163 项通过。新增 `ThinkTagSplitterTest`（6 项，含�
 ### 25.7 已知遗留
 
 `KnowledgeService` 仍保留一份实现同一 `AskKnowledge` 接口的单次检索版 `askStream`（自述 "Single-shot path: one search, one send"），与 `ChatModel.planRetrieval` 默认返回 `answer()` 一样，都是"换错一行装配就整体静默失效"的暴露面。本次只做签名适配，未删除。
+
+## 26. 查询优化与桌面交互增量（2026-08-09 至 2026-09-11）
+
+### 26.1 查询拆分、多查询与 HyDE
+
+首轮本地检索增加 `QueryDecomposer` 与 `QueryFusion`。拆分器只对明显包含多个独立主题的问题生成最多 3 个 facet，单主题问题和逗号枚举保持原样；各子查询结果按轮转方式融合后统一进入 MMR 和引用筛选，避免单个 facet 垄断上下文。
+
+追加规划轮使用 typed query：普通关键词查询走混合检索，HyDE 查询把模型生成的假设文档用于向量召回。每轮最多 3 条查询，首轮最多 6 个片段，全部轮次去重后最多 12 个片段。推理模型的规划可靠性与可观察性见第 25 节。
+
+### 26.2 Markdown 回答与引用定位
+
+`MarkdownText` / `MarkdownPane` 渲染标题、列表、引用块、分隔线、强调、行内代码和围栏代码块；流式正文以约 90 ms 的节奏合并刷新，减少 Swing 文档频繁重排。回答中的 `[n]` 被映射到当前 citation，点击后通过统一文件网关打开“文件”页并定位到行号、页码、章节或幻灯片；搜索结果也支持双击或“应用内打开”。复制仍使用模型原始文本，不把渲染标记或思考过程混入 transcript。
+
+### 26.3 启动、模型安装与工作区状态
+
+`StartupProgressWindow` 在主窗口出现前报告数据库、模型配置、知识库/索引恢复和界面准备阶段，并在启动失败时保留错误信息。设置页通过 `ModelDownloader` 安装或重新下载本地语义模型，完成后调用 provider reload，无需重启应用。
+
+`WorkspaceLayoutCoordinator` 把窗口位置、普通尺寸、最大化状态、侧栏宽度和正文字号保存到 `app_setting`；显示器拓扑变化时会把窗口收回当前屏幕。桌面端增加 Ctrl+K 搜索聚焦、Ctrl+= / Ctrl+- / Ctrl+0 字号控制以及可见键盘焦点环。
+
+### 26.4 schema v4 对话持久化与协调器拆分
+
+schema v4 新增 `conversation` 与 `conversation_message`，按知识库保存多段对话和完整 transcript；消息记录生成时的 `source_revision`。删除知识库或对话会级联删除消息，失败或取消的问答不落库。revision 变化保留可见历史，但 `ConversationStore` 只向模型提供当前 revision 的上下文。
+
+原 `DesktopWorkspaceController` 的职责拆分为 `ConversationCoordinator`、`ModelSettingsCoordinator` 和 `WorkspaceLayoutCoordinator`，主 controller 只负责页面组合与跨区域导航，降低问答、设置和窗口状态之间的耦合。

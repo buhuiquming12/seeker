@@ -14,16 +14,18 @@ SimpleRAG 是一个 Java 17 + Swing 桌面端本地知识库客户端，支持�
 
 ## 快速开始
 
-首次使用先安装约 122 MB 的多语言模型：
+首次启动时，即使尚未安装本地语义模型，客户端也可以正常打开；此时只能进行词法检索。进入“设置 → 本地语义模型”，可以查看安装状态、模型大小和目标目录，并直接下载或重新下载约 122 MB 的多语言模型。下载进度会显示在设置页，完成后模型立即重新加载，无需重启应用；已有知识库仍需重建索引后才能启用新向量。
 
-```powershell
-.\setup-semantic-model.cmd
-```
-
-脚本用纯 Java 下载器从 `HF_ENDPOINT` 指定的地址下载；未设置时默认使用 `https://hf-mirror.com`。模型保存到：
+下载源由 `HF_ENDPOINT` 控制，未设置时默认使用 `https://hf-mirror.com`。默认模型目录为：
 
 ```text
 D:\SimpleRAG\models\multilingual-minilm
+```
+
+也可以在启动前使用命令行预装：
+
+```powershell
+.\setup-semantic-model.cmd
 ```
 
 启动客户端：
@@ -125,20 +127,26 @@ POST <baseUrl>/chat/completions
 
 “设置”页将三类 API 分开保存：对话模型、向量模型和重排模型。向量 API 使用 `POST <baseUrl>/embeddings`，请求体包含 `model`、批量 `input`，可选 `dimensions`；重排 API 使用 `POST <baseUrl>/rerank`，请求体包含 `model`、`query`、`documents` 和 `top_n`。向量 API 返回的维度会校验并写入索引 manifest；切换向量服务或模型后必须重建索引，防止新旧向量混用。重排请求失败时会自动回退本地重排，不影响基础检索结果。
 
-问答先按用户问题召回最多 6 个片段；模型会评估当前证据，资料不足时自主生成更聚焦的检索词，并最多追加 3 轮本地检索。所有轮次合并去重，最多保留 12 个片段，然后流式生成带引用回答。每当新增片段扩大远程发送范围时，客户端都会更新“本轮引用”并再次显示准确范围供确认。
+问答首轮完全在本地进行：多主题问题会被保守拆分为最多 3 个子查询，各子查询结果按轮转方式融合，再统一执行 MMR 和引用筛选。单主题问题保持原样，逗号枚举不会被误拆。
+
+用户确认一次远程发送后，模型最多再执行 3 个追加规划轮（连同首轮共最多 4 轮）。每个规划轮可生成最多 3 个普通关键词查询或 HyDE 假设文档查询；普通查询走混合检索，HyDE 优先走向量检索。首轮最多取 6 个片段，全部轮次去重后最多发送 12 个片段。新增片段会实时更新“本轮引用”，但不会重复弹出授权窗口。
+
+推理模型返回的检索规划、实际生成的检索词和回答前思考会显示在可折叠的“思考过程”区域；回答正文开始后该区域自动收起。规划失败与“模型认为证据足够”会分别显示，不再静默混淆。客户端兼容 `reasoning_content`、`reasoning` 和流式 `<think>…</think>` 三类常见响应；思考过程不进入回答正文、剪贴板或持久化历史。
+
+助手回答支持 Markdown 子集，包括标题、无序/有序列表、引用块、分隔线、粗体、斜体、行内代码和围栏代码块。回答中的 `[n]` 引用标记可以点击，应用会打开“文件”页并定位到对应行、页码、章节或幻灯片；搜索结果也可双击或点击“应用内打开”完成同样定位。复制对话时保留模型原始文本。
 
 最终请求会发送问题、已确认片段的路径、页码/章节/行号等来源位置和内容，并要求模型用 `[1]`、`[2]` 标注引用。回答支持 SSE 流式显示和随时停止；服务不支持 SSE 时自动回退到非流式响应。
 
-知识问答页采用聊天气泡 UI（用户右对齐 / 助手左对齐），支持多轮追问：
+知识问答页采用聊天气泡 UI，并按知识库保存多段对话：
 
-- 多轮历史由内存模块 `application.conversation` 管理，绑定当前 `knowledgeBaseId + sourceRevision`。
-- 历史只保留 user/assistant 文本，不保留引用片段；每一轮都会重新检索并重新做 freshness 检查。
-- 默认最多保留约 12 轮、约 3000 token（粗估 chars/4）上下文；失败或取消的轮次不写入历史。
-- Enter 发送、Shift+Enter 换行，可清空对话；右侧展示「本轮引用」，双击打开源文件。
-- 回答和问题正文可以直接拖选并按 Ctrl+C；每条消息支持“复制”按钮和右键复制选中内容/整条消息。
-- 顶部支持“复制回答+引用”和“复制对话”，引用栏可单独复制 `[编号] 文件路径 · 来源位置`，便于粘贴到 issue、文档或 IDE。
-- 助手多行回答会按聊天区域宽度铺开，短消息按内容收缩，避免气泡之间出现大片留白。
-- 会话仅保存在内存，应用退出后不会恢复（SQLite 持久化尚未接入）。
+- 左侧“对话记录”可以新建和切换对话；对话按最近更新时间排序，标题取首个问题，超长内容自动省略。
+- 右键对话或选中后按 Delete 可以删除；删除知识库时，其全部对话和消息也会从本地 SQLite 级联删除。
+- 成功完成的 user/assistant 消息持久化到 SQLite，重新启动应用后仍可恢复；失败或取消的轮次不写入历史。
+- 每条消息记录生成时的 `source_revision`。完整 transcript 跨 revision 保留，但提供给模型的历史只取当前 revision；版本变化处会显示“模型从这里开始新的上下文”分隔线，避免旧文件上的回答被继续当作有效上下文。
+- 历史只保存问答正文，不保存旧引用片段；每一轮仍重新执行 freshness 检查和知识检索。
+- 模型可见历史受最近 12 条消息和约 3000 token 的预算限制。
+- Enter 发送、Shift+Enter 换行；生成中可以停止。
+- 顶部可以复制最近回答及引用或复制完整对话；思考过程和引用片段不会写入对话正文。
 
 问答 prompt 会要求模型先给直接结论；代码定位问题优先输出“文件路径 · 来源位置 · 类/方法”，保留代码和配置项原始拼写。召回正文被明确标记为不可信只读资料，文档中即使包含“忽略规则”等文字也不能作为模型指令；资料不足时必须说明缺少的信息，不能猜测不存在的文件或接口。
 
@@ -152,6 +160,19 @@ POST <baseUrl>/chat/completions
 - 每个知识库可勾选“仅本地 RAG”，该策略在 application use case 内阻止所有远程问答。
 - 敏感资料应使用本地兼容模型服务。
 - Windows 上 API Key 首选保存为当前用户的 Windows Credential Manager Generic Credential，SQLite 只保存 marker；原 AES-GCM 格式仅用于存量兼容或 Credential Manager 不可用时的 fallback。
+
+### 5. 界面与快捷键
+
+启动时会先显示进度窗口，依次报告数据库、模型配置、知识库/索引恢复和界面准备状态；启动失败时会保留错误窗口，而不是静默退出。
+
+应用会保存窗口位置、普通尺寸、最大化状态、左侧栏宽度和正文字号，并在下次启动时恢复；如果原显示器已断开，则回退到当前屏幕中央。
+
+- Ctrl+K：切换到“语义检索”并聚焦搜索框。
+- Ctrl+= / Ctrl++：放大回答、思考区、输入框、文件正文和检索预览。
+- Ctrl+-：缩小正文。
+- Ctrl+0：恢复默认字号。
+- Enter：发送问题；Shift+Enter：换行。
+- 按钮获得键盘焦点时会显示可见焦点环。
 
 ## 诊断与性能报告
 
@@ -212,24 +233,31 @@ watcher 只负责使旧索引失效，不会直接修改或发布索引。用户
 | 多语言 ONNX 模型 | `D:\SimpleRAG\models\multilingual-minilm` |
 | Maven 项目依赖 | `D:\SimpleRAG\.mvn\repository` |
 | SQLite 数据库 | `%USERPROFILE%\.simplerag\simplerag.db` |
+| 对话与消息 | 同一 SQLite 数据库中的 `conversation` / `conversation_message` |
+| 窗口布局与正文字号 | 同一 SQLite 数据库的 `app_setting`，键为 `ui.workspace.layout` |
 | 版本化索引 | `%USERPROFILE%\.simplerag\indexes\<知识库ID>\<revision>.bin` |
 | 可执行 JAR | `D:\SimpleRAG\target\SimpleRAG-1.0-SNAPSHOT.jar` |
 
-SQLite 使用版本化 migration。`knowledge_base` 保存 `source_revision`、`published_index_revision`、`index_status`、最近错误、`last_verified_source_hash`、`last_verified_at` 和 freshness 变化原因；`knowledge_index` 保存每个已发布 revision 的 manifest 元数据。
+SQLite 当前 schema 为版本 4。除知识库、数据源、索引发布和设置外，还保存按知识库归档的对话与消息；删除知识库或对话时，关联消息通过外键级联删除。`knowledge_base` 保存 `source_revision`、`published_index_revision`、`index_status`、最近错误、`last_verified_source_hash`、`last_verified_at` 和 freshness 变化原因；`knowledge_index` 保存每个已发布 revision 的 manifest 元数据。
 
 ## 架构
 
 ```text
 adapter.in.swing
   MainFrame（窗口组合、导航、关闭）
-  DesktopWorkspaceController（页面工作流）
+  DesktopWorkspaceController（页面组合）
+  ConversationCoordinator（问答、持久化对话列表）
+  ModelSettingsCoordinator（API 与本地模型）
+  WorkspaceLayoutCoordinator（窗口、侧栏与字号）
   KnowledgePanel / SearchPanel / AskPanel / StatusBar
   BackgroundTaskCoordinator / DesktopFileGateway
   KnowledgeController / SearchController / AskController
                 |
                 v
 application.port.in -> 独立 use cases + application DTO
-application.conversation（内存多轮会话）
+application.conversation
+  ConversationSession / ConversationStore
+  （按 conversationId + sourceRevision 缓存模型可见历史）
                 |
                 v
 ActiveKnowledgeRuntime + IndexLifecycle
@@ -238,10 +266,12 @@ ActiveKnowledgeRuntime + IndexLifecycle
 application.port.out
   KnowledgeBaseRepository / KnowledgeSourceRepository
   IndexPublicationRepository / FreshnessRepository / IndexRepository
+  ConversationRepository / EmbeddingModelStore
   ChatModel / SecretStore / SettingsRepository
                 ^
                 |
 adapter.out.sqlite / filesystem / onnx / openai / security
+  SqliteConversationRepository
 
 bootstrap.AppCompositionRoot
   唯一主要的具体依赖组装位置
@@ -266,7 +296,7 @@ SemanticHighlightService
 
 SQLite output ports 已按知识库、数据源、发布、freshness 和设置拆分，但共享 `SqliteTransactionManager`，因此接口隔离不会拆散跨表事务。
 
-架构决策见 [docs/adr](docs/adr)，UI/BLL/DAL/Model/Common 的职责映射见 [分层架构说明](docs/architecture/LAYERED_ARCHITECTURE.md)，结构稳定化与增量索引的需求、实现和测试映射见 [需求追踪矩阵](docs/REQUIREMENTS_TRACEABILITY.md)，Sprint、Backlog、Review 与 Retrospective 见 [敏捷开发证据](docs/agile/README.md)。
+完整开发与架构说明见 [DEVELOPMENT.md](DEVELOPMENT.md)，阶段计划见 [plan.md](plan.md)，历史运行记录见 [RUN_NOTES.md](RUN_NOTES.md)。
 
 ## 构建与测试
 
