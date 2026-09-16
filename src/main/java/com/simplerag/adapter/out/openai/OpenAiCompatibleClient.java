@@ -17,6 +17,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.simplerag.model.RagAnswer;
 import com.simplerag.model.RagCitation;
 import com.simplerag.application.diagnostics.DiagnosticSink;
+import com.simplerag.common.net.StreamReadDeadline;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -50,6 +51,8 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
      * traded truncation for a timeout without ever letting the adaptive loop reach a second search.
      */
     private static final Duration PLANNER_TIMEOUT = Duration.ofSeconds(60);
+    private static final String REASONING_ONLY_NOTICE =
+            "模型只返回了思考过程，未提供最终答案。请重试或关闭模型的思考模式。";
     private static final int PLANNER_BUDGET = 6_000;
     private static final int PLANNER_SNIPPET = 320;
     /**
@@ -156,7 +159,10 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
         Split split = Split.of(answer);
         answer = split.answer();
         reasoning = reasoning.isBlank() ? split.reasoning() : reasoning;
-        if (answer.isBlank()) throw new IOException("API 返回了空答案");
+        if (answer.isBlank()) {
+            if (reasoning.isBlank()) throw new IOException("API 返回了空答案");
+            answer = REASONING_ONLY_NOTICE;
+        }
         RagAnswer result = new RagAnswer(answer.strip(), List.copyOf(chatRequest.citations()), config.model(),
                 usage, reasoning);
         recordLatency("chat", config, started, "ok");
@@ -174,42 +180,21 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
         try {
             config.validateForChat();
             if (planRequest == null) throw new IllegalArgumentException("RetrievalPlanRequest must not be null");
-            PlanAttempt attempt;
+            RetrievalDecision decision;
             try {
-                attempt = requestPlan(config, planRequest, true);
-            } catch (IOException rejected) {
+                decision = requestPlan(config, planRequest, true);
+            } catch (ThinkingSwitchRejectedException rejected) {
                 // The thinking switches are vendor extensions; a strict relay answers 4xx instead of
                 // ignoring them. Losing the planning round over that would be worse than thinking.
                 recordPlannerRejection("thinking-switch-rejected", String.valueOf(rejected.getMessage()));
-                attempt = requestPlan(config, planRequest, false);
-                if (attempt.truncated()) attempt = retryWithoutThinking(config, planRequest, attempt);
+                decision = requestPlan(config, planRequest, false);
             }
-            RetrievalDecision decision = attempt.decision();
             recordLatency("retrieval-plan", config, started,
                     decision.plannerUnavailable() ? "unusable-decision" : "ok");
             return decision;
         } catch (IOException | InterruptedException | RuntimeException failure) {
             recordLatency("retrieval-plan", config, started, failure.getClass().getSimpleName());
             throw failure;
-        }
-    }
-
-    /**
-     * Last try after a decision truncated by the model's own thinking, asking the provider to skip it
-     * so the whole allowance goes to the JSON. Only reachable on endpoints that rejected the switches
-     * up front, so a failure here means we are out of options and keep the truncated verdict.
-     */
-    private PlanAttempt retryWithoutThinking(ApiConfig config, RetrievalPlanRequest planRequest,
-                                             PlanAttempt truncated) throws InterruptedException {
-        recordPlannerRejection("truncated-retry", "length");
-        try {
-            PlanAttempt retried = requestPlan(config, planRequest, true);
-            if (retried.truncated()) recordPlannerRejection("truncated-after-retry", "length");
-            // Both rounds were billed, so both must be reported.
-            return retried.withUsage(truncated.decision().usage().plus(retried.decision().usage()));
-        } catch (IOException retryFailed) {
-            recordPlannerRejection("retry-unreachable", String.valueOf(retryFailed.getMessage()));
-            return truncated;
         }
     }
 
@@ -222,7 +207,8 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
      * the timeout only covers the response headers. {@link #PLANNER_TIMEOUT} is re-applied below as a
      * read deadline so bypassing the request timeout cannot turn into an unbounded hang.
      */
-    private PlanAttempt requestPlan(ApiConfig config, RetrievalPlanRequest planRequest, boolean suppressThinking)
+    private RetrievalDecision requestPlan(ApiConfig config, RetrievalPlanRequest planRequest,
+                                          boolean suppressThinking)
             throws IOException, InterruptedException {
         ObjectNode payload = retrievalPlanPayload(config, planRequest, suppressThinking);
         HttpRequest request = request(config, endpoint(config.normalizedBaseUrl(), "chat/completions"),
@@ -230,7 +216,15 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
                 .header("Accept", "text/event-stream")
                 .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload))).build();
         HttpResponse<InputStream> response = sendWithRetry(request, HttpResponse.BodyHandlers.ofInputStream());
-        PlannerResponse planner = readPlannerResponse(response);
+        PlannerResponse planner;
+        try {
+            planner = readPlannerResponse(response);
+        } catch (IOException failure) {
+            if (suppressThinking && response.statusCode() >= 400 && response.statusCode() < 500) {
+                throw new ThinkingSwitchRejectedException(failure.getMessage(), failure);
+            }
+            throw failure;
+        }
         TokenUsage usage = observeUsage("retrieval-plan", config, payload, planner.usage());
         // Thinking arrives either in its own field or inlined in content; either way it must not reach
         // the JSON parser, which would see prose wrapped around the object it is looking for.
@@ -238,7 +232,7 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
         String reasoning = planner.reasoning().isBlank() ? split.reasoning() : planner.reasoning();
         RetrievalDecision decision = parseRetrievalDecision(split.answer(), planner.finishReason())
                 .withUsage(usage).withReasoning(reasoning);
-        return new PlanAttempt(decision, "length".equalsIgnoreCase(planner.finishReason()));
+        return decision;
     }
 
     /**
@@ -254,17 +248,14 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
         String finishReason = "";
         TokenUsage usage = TokenUsage.UNKNOWN;
         boolean streamed = false;
-        long deadline = System.nanoTime() + PLANNER_TIMEOUT.toNanos();
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
+        InputStream body = response.body();
+        StreamReadDeadline deadline = new StreamReadDeadline(body, PLANNER_TIMEOUT);
+        try (deadline; BufferedReader reader = new BufferedReader(
+                new InputStreamReader(body, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (Thread.currentThread().isInterrupted()) {
                     throw new InterruptedException("已取消问答");
-                }
-                if (System.nanoTime() > deadline) {
-                    recordPlannerRejection("stream-deadline", finishReason);
-                    break;
                 }
                 if (!line.startsWith("data:")) {
                     raw.append(line).append('\n');
@@ -286,6 +277,14 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
                 String reason = choice.path("finish_reason").asText("");
                 if (!reason.isBlank()) finishReason = reason;
             }
+            deadline.throwIfExpired("检索规划流在 " + PLANNER_TIMEOUT.toSeconds() + " 秒内未完成");
+        } catch (IOException failure) {
+            IOException translated = deadline.translate(failure,
+                    "检索规划流在 " + PLANNER_TIMEOUT.toSeconds() + " 秒内未完成");
+            if (translated instanceof java.net.http.HttpTimeoutException) {
+                recordPlannerRejection("stream-deadline", finishReason);
+            }
+            throw translated;
         }
         if (streamed) {
             return new PlannerResponse(content.toString(), reasoning.toString(), finishReason, usage);
@@ -317,10 +316,10 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
     /** What one planning round returned, normalised across the streamed and buffered shapes. */
     private record PlannerResponse(String content, String reasoning, String finishReason, TokenUsage usage) { }
 
-    /** One planning round trip: the decision it produced, and whether the provider cut it short. */
-    private record PlanAttempt(RetrievalDecision decision, boolean truncated) {
-        PlanAttempt withUsage(TokenUsage total) {
-            return new PlanAttempt(decision.withUsage(total), truncated);
+    /** Only a schema-level 4xx justifies retrying without the optional thinking switches. */
+    private static final class ThinkingSwitchRejectedException extends IOException {
+        private ThinkingSwitchRejectedException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -363,10 +362,13 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
                 if (onDelta != null) onDelta.accept(AnswerDelta.answer(text));
             }
         };
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
+        InputStream body = response.body();
+        StreamReadDeadline deadline = new StreamReadDeadline(body, CHAT_TIMEOUT);
+        try (deadline; BufferedReader reader = new BufferedReader(
+                new InputStreamReader(body, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
+                deadline.activity();
                 if (Thread.currentThread().isInterrupted()) {
                     throw new InterruptedException("已取消问答");
                 }
@@ -391,7 +393,10 @@ public final class OpenAiCompatibleClient implements com.simplerag.application.p
                 splitter.accept(extractDelta(choice), route);
             }
             splitter.flush(route);
+            deadline.throwIfExpired("回答流超过 " + CHAT_TIMEOUT.toSeconds() + " 秒没有数据");
         } catch (IOException streamFailure) {
+            streamFailure = deadline.translate(streamFailure,
+                    "回答流超过 " + CHAT_TIMEOUT.toSeconds() + " 秒没有数据");
             // The peer cut the stream. Replaying the request would duplicate the text already shown,
             // so keep what arrived; only a stream that produced no answer is worth retrying.
             splitter.flush(route);

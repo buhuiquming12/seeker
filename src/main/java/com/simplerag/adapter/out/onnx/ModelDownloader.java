@@ -2,6 +2,7 @@ package com.simplerag.adapter.out.onnx;
 
 import com.simplerag.application.dto.ModelDownloadProgress;
 import com.simplerag.application.port.out.EmbeddingModelStore;
+import com.simplerag.common.net.StreamReadDeadline;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -28,6 +29,7 @@ public final class ModelDownloader implements EmbeddingModelStore {
     private static final String DEFAULT_MIRROR = "https://hf-mirror.com";
     private static final String REPOSITORY = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
     private static final int BUFFER = 64 * 1024;
+    private static final Duration DOWNLOAD_IDLE_TIMEOUT = Duration.ofSeconds(90);
     /** Reporting every buffer would flood the UI with hundreds of events per second. */
     private static final long REPORT_STEP = 512 * 1024;
 
@@ -132,9 +134,11 @@ public final class ModelDownloader implements EmbeddingModelStore {
         byte[] buffer = new byte[BUFFER];
         long bytes = 0;
         long reported = 0;
-        try (OutputStream out = Files.newOutputStream(temporary)) {
+        StreamReadDeadline deadline = new StreamReadDeadline(body, DOWNLOAD_IDLE_TIMEOUT);
+        try (deadline; OutputStream out = Files.newOutputStream(temporary)) {
             int read;
             while ((read = body.read(buffer)) >= 0) {
+                deadline.activity();
                 if (Thread.interrupted()) throw new InterruptedException("下载已取消");
                 out.write(buffer, 0, read);
                 bytes += read;
@@ -143,6 +147,10 @@ public final class ModelDownloader implements EmbeddingModelStore {
                     progress.accept(new ModelDownloadProgress(name, fileIndex, fileCount, bytes, expected));
                 }
             }
+            deadline.throwIfExpired("模型下载超过 " + DOWNLOAD_IDLE_TIMEOUT.toSeconds() + " 秒没有数据");
+        } catch (IOException failure) {
+            throw deadline.translate(failure,
+                    "模型下载超过 " + DOWNLOAD_IDLE_TIMEOUT.toSeconds() + " 秒没有数据");
         }
         return bytes;
     }

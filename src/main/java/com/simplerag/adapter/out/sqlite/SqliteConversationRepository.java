@@ -127,27 +127,20 @@ public final class SqliteConversationRepository implements ConversationRepositor
     public void appendMessage(String conversationId, ChatMessage message, long sourceRevision) {
         transactions.execute("无法保存对话内容", connection -> {
             long seq = nextSequence(conversationId, connection);
-            String insert = """
-                    INSERT INTO conversation_message(id, conversation_id, seq, role, content,
-                                                     source_revision, created_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
-                    """;
-            try (PreparedStatement statement = connection.prepareStatement(insert)) {
-                statement.setString(1, message.id());
-                statement.setString(2, conversationId);
-                statement.setLong(3, seq);
-                statement.setString(4, message.role().name());
-                statement.setString(5, message.content());
-                statement.setLong(6, sourceRevision);
-                statement.setLong(7, message.createdAt().toEpochMilli());
-                statement.executeUpdate();
-            }
-            try (PreparedStatement touch = connection.prepareStatement(
-                    "UPDATE conversation SET updated_at = ? WHERE id = ?")) {
-                touch.setLong(1, System.currentTimeMillis());
-                touch.setString(2, conversationId);
-                touch.executeUpdate();
-            }
+            insertMessage(connection, conversationId, message, sourceRevision, seq);
+            touchConversation(connection, conversationId);
+            return null;
+        });
+    }
+
+    @Override
+    public void appendTurn(String conversationId, ChatMessage user, ChatMessage assistant,
+                           long sourceRevision) {
+        transactions.execute("无法保存完整对话回合", connection -> {
+            long seq = nextSequence(conversationId, connection);
+            insertMessage(connection, conversationId, user, sourceRevision, seq);
+            insertMessage(connection, conversationId, assistant, sourceRevision, seq + 1);
+            touchConversation(connection, conversationId);
             return null;
         });
     }
@@ -171,6 +164,34 @@ public final class SqliteConversationRepository implements ConversationRepositor
             try (ResultSet rows = statement.executeQuery()) {
                 return rows.next() ? rows.getLong(1) : 0L;
             }
+        }
+    }
+
+    private static void insertMessage(Connection connection, String conversationId, ChatMessage message,
+                                      long sourceRevision, long seq) throws SQLException {
+        String insert = """
+                INSERT INTO conversation_message(id, conversation_id, seq, role, content,
+                                                 source_revision, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(insert)) {
+            statement.setString(1, message.id());
+            statement.setString(2, conversationId);
+            statement.setLong(3, seq);
+            statement.setString(4, message.role().name());
+            statement.setString(5, message.content());
+            statement.setLong(6, sourceRevision);
+            statement.setLong(7, message.createdAt().toEpochMilli());
+            statement.executeUpdate();
+        }
+    }
+
+    private static void touchConversation(Connection connection, String conversationId) throws SQLException {
+        try (PreparedStatement touch = connection.prepareStatement(
+                "UPDATE conversation SET updated_at = ? WHERE id = ?")) {
+            touch.setLong(1, System.currentTimeMillis());
+            touch.setString(2, conversationId);
+            touch.executeUpdate();
         }
     }
 

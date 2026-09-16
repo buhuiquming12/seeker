@@ -124,7 +124,12 @@ public final class ChunkerRegistry {
             boolean full = tokens >= PROSE_TARGET_TOKENS;
             if (paragraphBoundary || full) {
                 addChunk(chunks, document, section, start, index + 1, "");
-                start = full ? overlapStart(section.units(), start, index + 1, PROSE_OVERLAP_TOKENS) : index + 1;
+                int next = full
+                        ? overlapStart(section.units(), start, index + 1, PROSE_OVERLAP_TOKENS)
+                        : index + 1;
+                // One oversized unit can itself exceed the target. In that case overlapStart returns
+                // the old start; accepting it makes every following chunk repeat the same prefix.
+                start = next <= start ? index + 1 : next;
                 tokens = tokenCount(section.units(), start, index + 1);
             }
         }

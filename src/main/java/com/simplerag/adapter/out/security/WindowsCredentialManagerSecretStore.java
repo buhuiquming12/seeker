@@ -17,6 +17,7 @@ import java.util.Map;
 public final class WindowsCredentialManagerSecretStore implements SecretStore {
     private static final int CRED_TYPE_GENERIC = 1;
     private static final int CRED_PERSIST_LOCAL_MACHINE = 2;
+    private static final int ERROR_NOT_FOUND = 1168;
     private static final String MARKER = "wincred:v1:SimpleRAG/API";
     private static final String TARGET = "SimpleRAG/API";
     private final SecretStore fallback;
@@ -57,9 +58,9 @@ public final class WindowsCredentialManagerSecretStore implements SecretStore {
             diagnostics.record("credential stored", "security", "API credential stored in Windows Credential Manager");
             return marker(target);
         } catch (RuntimeException failure) {
-            diagnostics.record("credential fallback", "security", failure.getClass().getSimpleName(),
-                    Map.of("backend", "application-encrypted"));
-            return fallback.encrypt(plainText);
+            diagnostics.record("credential store failed", "security", failure.getClass().getSimpleName(),
+                    Map.of("backend", "windows-credential-manager"));
+            throw new IllegalStateException("无法写入 Windows 凭据管理器，API Key 未保存", failure);
         }
     }
 
@@ -75,9 +76,17 @@ public final class WindowsCredentialManagerSecretStore implements SecretStore {
         // The original chat credential used this fixed marker and target; keep it readable.
         if (MARKER.equals(encoded)) target = TARGET;
         else if (!marker(target).equals(encoded)) return fallback.decrypt(encoded);
-        if (!isWindows()) return fallback.decrypt(encoded);
+        if (!isWindows()) {
+            throw new IllegalStateException("该 API Key 保存在 Windows 凭据管理器，当前系统无法读取");
+        }
         PointerByReference reference = new PointerByReference();
-        if (!CredentialsApi.INSTANCE.CredReadW(new WString(target), CRED_TYPE_GENERIC, 0, reference)) return "";
+        if (!CredentialsApi.INSTANCE.CredReadW(new WString(target), CRED_TYPE_GENERIC, 0, reference)) {
+            int error = Native.getLastError();
+            if (error == ERROR_NOT_FOUND) {
+                throw new IllegalStateException("数据库记录了 API Key，但 Windows 凭据管理器中已不存在");
+            }
+            throw new IllegalStateException("无法读取 Windows 凭据管理器，错误码 " + error);
+        }
         Pointer pointer = reference.getValue();
         Credential credential = new Credential(pointer);
         try {
@@ -90,7 +99,13 @@ public final class WindowsCredentialManagerSecretStore implements SecretStore {
     }
 
     private void deleteCredential(String target) {
-        if (isWindows()) CredentialsApi.INSTANCE.CredDeleteW(new WString(target), CRED_TYPE_GENERIC, 0);
+        if (!isWindows()) return;
+        if (!CredentialsApi.INSTANCE.CredDeleteW(new WString(target), CRED_TYPE_GENERIC, 0)) {
+            int error = Native.getLastError();
+            if (error != ERROR_NOT_FOUND) {
+                throw new IllegalStateException("无法从 Windows 凭据管理器删除 API Key，错误码 " + error);
+            }
+        }
     }
 
     private static String target(String namespace) {

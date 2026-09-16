@@ -129,6 +129,29 @@ public final class DatabaseManager {
                         statement.executeUpdate(
                                 "CREATE INDEX idx_conversation_message_seq ON conversation_message(conversation_id, seq)");
                         statement.executeUpdate("UPDATE schema_version SET version = 4");
+                        version = 4;
+                    }
+                    if (version < 5) {
+                        // Older builds did not enforce sequence uniqueness. Re-number deterministically
+                        // before replacing the ordinary index so an existing duplicate cannot make the
+                        // migration fail at startup.
+                        statement.executeUpdate("""
+                                WITH ordered AS (
+                                  SELECT id, ROW_NUMBER() OVER (
+                                    PARTITION BY conversation_id
+                                    ORDER BY seq, created_at, id
+                                  ) - 1 AS new_seq
+                                  FROM conversation_message
+                                )
+                                UPDATE conversation_message
+                                SET seq = (SELECT new_seq FROM ordered
+                                           WHERE ordered.id = conversation_message.id)
+                                """);
+                        statement.executeUpdate("DROP INDEX idx_conversation_message_seq");
+                        statement.executeUpdate(
+                                "CREATE UNIQUE INDEX idx_conversation_message_seq "
+                                        + "ON conversation_message(conversation_id, seq)");
+                        statement.executeUpdate("UPDATE schema_version SET version = 5");
                     }
                     connection.commit();
                 } catch (Exception failure) {

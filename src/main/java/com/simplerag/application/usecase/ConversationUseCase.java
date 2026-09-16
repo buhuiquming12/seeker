@@ -82,8 +82,8 @@ public final class ConversationUseCase implements ManageConversations {
     @Override
     public void recordTurn(String conversationId, String question, String answer, long sourceRevision) {
         if (question == null || question.isBlank() || answer == null || answer.isBlank()) return;
-        repository.appendMessage(conversationId, ChatMessage.user(question), sourceRevision);
-        repository.appendMessage(conversationId, ChatMessage.assistant(answer), sourceRevision);
+        repository.appendTurn(conversationId, ChatMessage.user(question),
+                ChatMessage.assistant(answer), sourceRevision);
         repository.conversation(conversationId)
                 .filter(conversation -> conversation.title().isBlank())
                 .ifPresent(conversation ->

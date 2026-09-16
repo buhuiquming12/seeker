@@ -23,5 +23,12 @@ public interface ConversationRepository {
 
     void appendMessage(String conversationId, ChatMessage message, long sourceRevision);
 
+    /** Persists both sides of a completed turn atomically when the adapter supports transactions. */
+    default void appendTurn(String conversationId, ChatMessage user, ChatMessage assistant,
+                            long sourceRevision) {
+        appendMessage(conversationId, user, sourceRevision);
+        appendMessage(conversationId, assistant, sourceRevision);
+    }
+
     void deleteConversation(String conversationId);
 }

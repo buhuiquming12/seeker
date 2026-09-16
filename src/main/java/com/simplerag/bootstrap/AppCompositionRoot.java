@@ -120,17 +120,21 @@ public final class AppCompositionRoot {
                     new SqliteConversationRepository(database));
             progress.stage("正在准备界面…");
             SwingUtilities.invokeLater(() -> {
-                MainFrame frame = new MainFrame(
-                        new KnowledgeController(knowledgeBases, sources, indexBuild, desktopQueries,
-                                localModel),
-                        new SearchController(search), new AskController(ask, service, conversations,
-                                new ConversationStore(ConversationContext.defaults(tokens))),
-                        new FileBrowserController(explorer),
-                        new BackgroundTaskCoordinator(), new SystemDesktopFileGateway(),
-                        workspaceLayout, new DiagnosticReportService(runtime, diagnostics));
-                frame.setVisible(true);
-                progress.close();
-                frame.initializeKnowledge(Path.of("examples", "knowledge"));
+                try {
+                    MainFrame frame = new MainFrame(
+                            new KnowledgeController(knowledgeBases, sources, indexBuild, desktopQueries,
+                                    localModel),
+                            new SearchController(search), new AskController(ask, service, conversations,
+                                    new ConversationStore(ConversationContext.defaults(tokens))),
+                            new FileBrowserController(explorer),
+                            new BackgroundTaskCoordinator(), new SystemDesktopFileGateway(),
+                            workspaceLayout, new DiagnosticReportService(runtime, diagnostics));
+                    frame.setVisible(true);
+                    progress.close();
+                    frame.initializeKnowledge(Path.of("examples", "knowledge"));
+                } catch (Throwable failure) {
+                    progress.failed(failure);
+                }
             });
         } catch (Throwable failure) {
             progress.failed(failure);

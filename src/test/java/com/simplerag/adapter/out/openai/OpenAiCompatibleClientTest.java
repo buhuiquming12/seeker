@@ -395,6 +395,43 @@ class OpenAiCompatibleClientTest {
     }
 
     @Test
+    void reasoningOnlyFallbackReturnsAnHonestNoticeAndPreservesBothThoughts() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            if (calls.incrementAndGet() == 1) {
+                String sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"streamed thought\"}}]}\n\n"
+                        + "data: [DONE]\n\n";
+                byte[] bytes = sse.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+                exchange.sendResponseHeaders(200, bytes.length);
+                exchange.getResponseBody().write(bytes);
+                exchange.close();
+                return;
+            }
+            respond(exchange, "{\"choices\":[{\"message\":{\"content\":\"\","
+                    + "\"reasoning_content\":\"fallback thought\"}}]}");
+        });
+        server.start();
+        try {
+            StringBuilder streamed = new StringBuilder();
+            RagAnswer answer = new OpenAiCompatibleClient().answerStream(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    streamRequest(), delta -> {
+                        if (delta.reasoning()) streamed.append(delta.text());
+                    });
+
+            assertEquals(2, calls.get());
+            assertEquals("streamed thought", streamed.toString());
+            assertEquals("模型只返回了思考过程，未提供最终答案。请重试或关闭模型的思考模式。", answer.text());
+            assertEquals("streamed thought\nfallback thought", answer.reasoning());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void aRelayThatRejectsTheThinkingSwitchesIsRetriedOnThePlainSchema() throws Exception {
         // enable_thinking / reasoning_effort are vendor extensions. A strict relay answers 400 rather
         // than ignoring them, and losing the planning round over that would be worse than thinking.
@@ -428,6 +465,40 @@ class OpenAiCompatibleClientTest {
             assertEquals(List.of("ChunkerRegistry 注册"), decision.queryTexts());
             assertFalse(retryBody.get().contains("enable_thinking"),
                     "the retry must drop the switches the relay refused");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aTruncatedPlainPlannerResponseDoesNotResendRejectedThinkingSwitches() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            int call = calls.incrementAndGet();
+            if (call == 1) {
+                assertTrue(body.contains("enable_thinking"));
+                byte[] error = "{\"error\":{\"message\":\"unknown field enable_thinking\"}}"
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(400, error.length);
+                exchange.getResponseBody().write(error);
+                exchange.close();
+                return;
+            }
+            assertFalse(body.contains("enable_thinking"));
+            respond(exchange, "{\"choices\":[{\"finish_reason\":\"length\","
+                    + "\"message\":{\"content\":\"{\\\"action\\\":\"}}]}");
+        });
+        server.start();
+        try {
+            RetrievalDecision decision = new OpenAiCompatibleClient().planRetrieval(
+                    new ApiConfig("http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "k", "m"),
+                    new RetrievalPlanRequest("kb", 1L, "q", List.of(), List.of(),
+                            List.of(new RetrievalAttempt("q", 0)), 3));
+
+            assertEquals(2, calls.get(), "the third request would deterministically repeat rejected fields");
+            assertTrue(decision.plannerUnavailable());
         } finally {
             server.stop(0);
         }

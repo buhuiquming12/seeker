@@ -56,6 +56,31 @@ class IndexConsistencyTest {
     }
 
     @Test
+    void obsoleteBuildCannotOverwriteANewerBuildState() throws Exception {
+        AppRepository repository = new AppRepository(
+                new DatabaseManager(temporaryDirectory.resolve("overlapping-builds.db")));
+        KnowledgeBase created = repository.createKnowledgeBase("overlap", "");
+        Path firstSource = Files.createDirectories(temporaryDirectory.resolve("overlap-source-a"));
+        repository.addSource(created.id(), firstSource);
+        KnowledgeBase beforeA = repository.findKnowledgeBase(created.id()).orElseThrow();
+        long buildA = repository.beginIndexBuildRevision(created.id(), beforeA.sourceRevision());
+
+        // A source change invalidates A and the UI immediately starts B at the new revision.
+        Path secondSource = Files.createDirectories(temporaryDirectory.resolve("overlap-source-b"));
+        repository.addSource(created.id(), secondSource);
+        KnowledgeBase beforeB = repository.findKnowledgeBase(created.id()).orElseThrow();
+        long buildB = repository.beginIndexBuildRevision(created.id(), beforeB.sourceRevision());
+        assertNotEquals(buildA, buildB);
+
+        assertFalse(repository.markIndexBuildDiscarded(created.id(), buildA, "A is stale"));
+        repository.markIndexBuildFailed(created.id(), buildA, "A failed late");
+
+        KnowledgeBase current = repository.findKnowledgeBase(created.id()).orElseThrow();
+        assertEquals(buildB, current.sourceRevision());
+        assertEquals(IndexStatus.BUILDING, current.indexStatus());
+    }
+
+    @Test
     void migratesLegacyDatabaseAndPreservesRows() throws Exception {
         Path databaseFile = temporaryDirectory.resolve("legacy.db");
         try (var connection = DriverManager.getConnection("jdbc:sqlite:" + databaseFile);

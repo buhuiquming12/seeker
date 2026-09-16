@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -95,6 +96,52 @@ class AskUseCaseAuthorizationTest {
                 "the final answer should cite the widened scope");
     }
 
+    @Test
+    void productionAskUseCaseBlocksLocalOnlyBeforeAnyRemoteCall() throws Exception {
+        Path source = Files.createDirectories(temporaryDirectory.resolve("local-only-source"));
+        Files.writeString(source.resolve("note.txt"), "credentials belong in environment variables");
+        AppRepository repository = new AppRepository(
+                new DatabaseManager(temporaryDirectory.resolve("local-only.db")));
+        KnowledgeBase ready = publishReadyKnowledgeBase(repository, source);
+        repository.putSetting("rag.local_only." + ready.id(), "true");
+        SemanticSearchEngine engine = new SemanticSearchEngine(new LexicalOnlyEmbedder());
+        engine.index(List.of(source), null);
+        ImmediateFreshnessMonitor monitor = verifiedMonitor(ready, source);
+        ActiveKnowledgeRuntime runtime = new ActiveKnowledgeRuntime(new IndexLifecycle());
+        runtime.restore(new ActiveKnowledgeContext(ready, monitor.snapshot(),
+                new IndexHandle(ready.id(), ready.sourceRevision(), ready.indexStatus(), engine)));
+        CountingChat chat = new CountingChat();
+        AskUseCase ask = new AskUseCase(runtime, repository, new FreshnessGate(monitor),
+                chat, repository, null);
+
+        assertThrows(IllegalStateException.class, () -> ask.askStream(ready.id(), ready.sourceRevision(),
+                "credentials", List.of(), CONFIG, ignored -> { }, ignored -> true, ignored -> { }));
+        assertEquals(0, chat.calls.get());
+    }
+
+    @Test
+    void productionAskUseCaseBlocksWhenFreshnessProofIsLost() throws Exception {
+        Path source = Files.createDirectories(temporaryDirectory.resolve("stopped-monitor-source"));
+        Files.writeString(source.resolve("note.txt"), "credentials belong in environment variables");
+        AppRepository repository = new AppRepository(
+                new DatabaseManager(temporaryDirectory.resolve("stopped-monitor.db")));
+        KnowledgeBase ready = publishReadyKnowledgeBase(repository, source);
+        SemanticSearchEngine engine = new SemanticSearchEngine(new LexicalOnlyEmbedder());
+        engine.index(List.of(source), null);
+        ImmediateFreshnessMonitor monitor = verifiedMonitor(ready, source);
+        ActiveKnowledgeRuntime runtime = new ActiveKnowledgeRuntime(new IndexLifecycle());
+        runtime.restore(new ActiveKnowledgeContext(ready, monitor.snapshot(),
+                new IndexHandle(ready.id(), ready.sourceRevision(), ready.indexStatus(), engine)));
+        monitor.close();
+        CountingChat chat = new CountingChat();
+        AskUseCase ask = new AskUseCase(runtime, repository, new FreshnessGate(monitor),
+                chat, repository, null);
+
+        assertThrows(IllegalStateException.class, () -> ask.askStream(ready.id(), ready.sourceRevision(),
+                "credentials", List.of(), CONFIG, ignored -> { }, ignored -> true, ignored -> { }));
+        assertEquals(0, chat.calls.get());
+    }
+
     private KnowledgeBase publishReadyKnowledgeBase(AppRepository repository, Path source) {
         KnowledgeBase created = repository.createKnowledgeBase("kb", "");
         repository.addSource(created.id(), source);
@@ -147,6 +194,24 @@ class AskUseCaseAuthorizationTest {
         @Override public RetrievalDecision planRetrieval(ApiConfig config, RetrievalPlanRequest request)
                 throws IOException {
             return next < decisions.size() ? decisions.get(next++) : RetrievalDecision.answer();
+        }
+    }
+
+    private static final class CountingChat implements ChatModel {
+        private final AtomicInteger calls = new AtomicInteger();
+
+        @Override public List<String> listModels(ApiConfig config) { return List.of(config.model()); }
+        @Override public RagAnswer answer(ApiConfig config, ChatRequest request) {
+            calls.incrementAndGet();
+            return new RagAnswer("answer", request.citations(), config.model());
+        }
+        @Override public RagAnswer answerStream(ApiConfig config, ChatRequest request,
+                                                Consumer<com.simplerag.application.conversation.AnswerDelta> onDelta) {
+            return answer(config, request);
+        }
+        @Override public RetrievalDecision planRetrieval(ApiConfig config, RetrievalPlanRequest request) {
+            calls.incrementAndGet();
+            return RetrievalDecision.answer();
         }
     }
 }

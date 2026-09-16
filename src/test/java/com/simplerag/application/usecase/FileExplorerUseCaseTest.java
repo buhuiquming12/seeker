@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class FileExplorerUseCaseTest {
     private static final String KB = "kb-files";
@@ -169,6 +170,23 @@ class FileExplorerUseCaseTest {
         assertThrows(IllegalArgumentException.class, () -> explorer.describe(KB, REVISION, secret));
         assertThrows(IllegalArgumentException.class,
                 () -> explorer.children(KB, REVISION, root.resolve("..")));
+    }
+
+    @Test
+    void refusesTraversalThroughASymbolicLinkInsideTheRoot() throws IOException {
+        Path outside = Files.createDirectory(workspace.resolve("linked-outside"));
+        write(outside.resolve("secret.md"), "不该被看到");
+        Path link = root.resolve("escape");
+        try {
+            Files.createSymbolicLink(link, outside);
+        } catch (UnsupportedOperationException | IOException denied) {
+            assumeTrue(false, "当前文件系统不允许创建测试符号链接：" + denied.getMessage());
+        }
+
+        assertThrows(IllegalArgumentException.class,
+                () -> explorer.children(KB, REVISION, link));
+        assertThrows(IllegalArgumentException.class,
+                () -> explorer.readFile(KB, REVISION, link.resolve("secret.md")));
     }
 
     @Test

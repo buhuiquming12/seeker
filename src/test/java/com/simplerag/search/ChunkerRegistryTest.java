@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class ChunkerRegistryTest {
     @TempDir Path temp;
@@ -46,6 +47,22 @@ class ChunkerRegistryTest {
         assertTrue(chunks.size() > 1);
         assertTrue(chunks.stream().allMatch(chunk -> ChunkerRegistry.estimateTokens(chunk.content()) <= 400),
                 "normal prose units should remain near the 320-token target including overlap");
+    }
+
+    @Test
+    void oversizedProseUnitCannotPinEveryFollowingWindowToTheSameStart() {
+        List<DocumentTextUnit> units = new ArrayList<>();
+        units.add(new DocumentTextUnit(1, "oversized ".repeat(500)));
+        for (int line = 2; line <= 22; line++) {
+            units.add(new DocumentTextUnit(line, "small trailing unit " + line));
+        }
+
+        List<DocumentChunk> chunks = new ChunkerRegistry().chunk(document("wide.csv", "csv", units));
+
+        assertEquals(2, chunks.size(), "one oversized row must not be repeated in every later chunk");
+        assertEquals(1, chunks.get(0).startLine());
+        assertTrue(chunks.get(1).startLine() > chunks.get(0).startLine());
+        assertTrue(chunks.get(1).content().length() < chunks.get(0).content().length());
     }
 
     private ReadDocument document(String name, String extension, List<DocumentTextUnit> units) {

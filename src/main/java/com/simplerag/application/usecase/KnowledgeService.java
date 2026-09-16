@@ -264,7 +264,9 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
             return report;
         } catch (IOException | RuntimeException failure) {
             if (failure instanceof StaleTaskException || failure instanceof InterruptedIOException) {
-                publications.markIndexDirty(request.knowledgeBaseId(), failure.getMessage());
+                // Do not let an obsolete/cancelled build overwrite a newer BUILDING attempt.
+                publications.markIndexBuildDiscarded(request.knowledgeBaseId(),
+                        request.sourceRevision(), failure.getMessage());
                 diagnostics.record(failure instanceof InterruptedIOException
                                 ? "index build cancelled" : "stale task discarded",
                         "index", failure.getClass().getSimpleName(), java.util.Map.of(
@@ -312,6 +314,7 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
 
     public RagAnswer ask(String question, ApiConfig config) throws IOException, InterruptedException {
         IndexHandle handle = requireReadyHandle();
+        requireRemoteAllowed(handle.knowledgeBaseId());
         List<RagCitation> citations = retrieveCitations(handle, question);
         freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision());
         ChatRequest request = new ChatRequest(handle.knowledgeBaseId(), handle.sourceRevision(),
@@ -327,6 +330,7 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
     public RagAnswer askStream(String question, ApiConfig config, Consumer<List<RagCitation>> onCitations,
                                Consumer<AnswerDelta> onDelta) throws IOException, InterruptedException {
         IndexHandle handle = requireReadyHandle();
+        requireRemoteAllowed(handle.knowledgeBaseId());
         List<RagCitation> citations = retrieveCitations(handle, question);
         if (onCitations != null) onCitations.accept(citations);
         freshnessGate.requireFresh(handle.knowledgeBaseId(), handle.sourceRevision());
@@ -342,6 +346,7 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
                                    Consumer<AnswerDelta> onDelta)
             throws IOException, InterruptedException {
         IndexHandle handle = requireReadyHandle(knowledgeBaseId, expectedRevision);
+        requireRemoteAllowed(knowledgeBaseId);
         List<RagCitation> citations = retrieveCitations(handle, question);
         List<CitationView> citationViews = citations.stream().map(KnowledgeService::toView).toList();
         if (onCitations != null) onCitations.accept(citationViews);
@@ -357,6 +362,13 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
         RagAnswer answer = apiClient.answerStream(config, request, onDelta);
         return new AskResultView(answer.text(), citationViews, answer.model());
     }
+
+    private void requireRemoteAllowed(String knowledgeBaseId) {
+        if (apiSettings.localOnly(knowledgeBaseId)) {
+            throw new IllegalStateException("当前知识库启用了“仅本地 RAG”，已禁止远程发送");
+        }
+    }
+
     private List<RagCitation> retrieveCitations(IndexHandle handle, String question) {
         List<SearchResult> results = handle.engine().search(question, 8, "全部");
         return java.util.stream.IntStream.range(0, Math.min(6, results.size()))
@@ -479,7 +491,10 @@ public final class KnowledgeService implements ManageKnowledgeBases, ManageKnowl
         try {
             indexRepository.cleanTemporaryFiles(selected.id());
             indexRepository.cleanUnreferenced(selected.id(), selected.publishedIndexRevision());
-        } catch (IOException ignored) {
+        } catch (IOException cleanupFailure) {
+            diagnostics.record("index cleanup failed", "index", cleanupFailure.getClass().getSimpleName(),
+                    java.util.Map.of("knowledgeBaseId", selected.id(),
+                            "message", String.valueOf(cleanupFailure.getMessage())));
         }
         Optional<IndexSnapshot> snapshot = Optional.empty();
         if (selected.publishedIndexRevision() != null) {

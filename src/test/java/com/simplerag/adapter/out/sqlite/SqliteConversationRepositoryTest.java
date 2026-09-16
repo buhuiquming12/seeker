@@ -13,6 +13,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class SqliteConversationRepositoryTest {
     @TempDir Path temp;
@@ -90,6 +91,24 @@ class SqliteConversationRepositoryTest {
 
         assertTrue(repository.conversations(knowledgeBase).isEmpty());
         assertEquals(0, countMessages(database));
+    }
+
+    @Test
+    void aCompletedTurnIsAllOrNothing() {
+        DatabaseManager database = new DatabaseManager(temp.resolve("app.db"));
+        SqliteConversationRepository repository = new SqliteConversationRepository(database);
+        String knowledgeBase = knowledgeBase(database, "笔记");
+        ConversationView conversation = create(repository, knowledgeBase);
+        ChatMessage user = ChatMessage.user("问题");
+        // Deliberately violate the message primary key on the second insert. The first insert must
+        // roll back with it instead of leaving an orphaned user message.
+        ChatMessage invalidAssistant = new ChatMessage(user.id(), ChatMessage.Role.ASSISTANT,
+                "回答", user.createdAt());
+
+        assertThrows(DataAccessException.class, () -> repository.appendTurn(
+                conversation.id(), user, invalidAssistant, 1L));
+
+        assertTrue(repository.messages(conversation.id()).isEmpty());
     }
 
     private static ConversationView create(SqliteConversationRepository repository, String knowledgeBaseId) {

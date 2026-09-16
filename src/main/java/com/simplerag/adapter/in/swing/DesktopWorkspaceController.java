@@ -205,7 +205,15 @@ public final class DesktopWorkspaceController {
     private void rebuildIndex() {
         setIndexing(true, "正在扫描当前知识库...");
         KnowledgeController.TaskIdentity identity = knowledge.identity();
-        tasks.<IndexBuildResult, IndexBuildProgress>submit(identity, knowledge::identity,
+        // A READY rebuild deliberately advances sourceRevision before it publishes. Comparing the
+        // whole pre-build identity at completion would therefore discard every successful rebuild.
+        // The service itself guards source revisions and publication; the UI only has to reject a
+        // result after the user switched to another knowledge base.
+        tasks.<IndexBuildResult, IndexBuildProgress>submit(identity.knowledgeBaseId(),
+                () -> {
+                    KnowledgeBase current = knowledge.current();
+                    return current == null ? null : current.id();
+                },
                 publish -> knowledge.rebuild(publish), values -> {
                     IndexBuildProgress latest = values.get(values.size() - 1);
                     knowledgePanel.progress(latest.processed(), latest.total());

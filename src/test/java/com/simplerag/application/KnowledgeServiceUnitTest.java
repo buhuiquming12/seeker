@@ -155,11 +155,18 @@ class KnowledgeServiceUnitTest {
         }
         @Override public void markIndexBuildFailed(String id, long revision, String error) {
             KnowledgeBase old = knowledgeBases.get(id);
-            replace(old, old.sourceRevision(), old.publishedIndexRevision(),
-                    old.sourceRevision() == revision ? IndexStatus.FAILED : IndexStatus.DIRTY, error);
+            if (old.sourceRevision() == revision && old.indexStatus() == IndexStatus.BUILDING) {
+                replace(old, old.sourceRevision(), old.publishedIndexRevision(), IndexStatus.FAILED, error);
+            }
         }
         @Override public void markIndexIncompatible(String id, String error) { status(id, IndexStatus.INCOMPATIBLE, error); }
         @Override public void markIndexDirty(String id, String error) { status(id, IndexStatus.DIRTY, error); }
+        @Override public boolean markIndexBuildDiscarded(String id, long revision, String error) {
+            KnowledgeBase old = knowledgeBases.get(id);
+            if (old.sourceRevision() != revision || old.indexStatus() != IndexStatus.BUILDING) return false;
+            replace(old, old.sourceRevision(), old.publishedIndexRevision(), IndexStatus.DIRTY, error);
+            return true;
+        }
         @Override public boolean markIndexDirtyIfCurrent(String id, long revision, String reason,
                                                          String observedHash, Long verifiedAt) {
             KnowledgeBase old = knowledgeBases.get(id);

@@ -240,14 +240,13 @@ public final class AppRepository implements com.simplerag.application.port.out.K
     public void markIndexBuildFailed(String knowledgeBaseId, long revision, String error) {
         String sql = """
                 UPDATE knowledge_base
-                SET index_status = CASE WHEN source_revision = ? THEN 'FAILED' ELSE 'DIRTY' END,
-                    last_index_error = ?
-                WHERE id = ?
+                SET index_status = 'FAILED', last_index_error = ?
+                WHERE id = ? AND source_revision = ? AND index_status = 'BUILDING'
                 """;
         try (Connection connection = database.connect(); PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setLong(1, revision);
-            statement.setString(2, error == null ? "" : error);
-            statement.setString(3, knowledgeBaseId);
+            statement.setString(1, error == null ? "" : error);
+            statement.setString(2, knowledgeBaseId);
+            statement.setLong(3, revision);
             statement.executeUpdate();
         } catch (SQLException failure) {
             throw new DataAccessException("无法记录索引失败状态", failure);
@@ -260,6 +259,22 @@ public final class AppRepository implements com.simplerag.application.port.out.K
 
     public void markIndexDirty(String knowledgeBaseId, String error) {
         updateStatus(knowledgeBaseId, IndexStatus.DIRTY, error);
+    }
+
+    @Override
+    public boolean markIndexBuildDiscarded(String knowledgeBaseId, long revision, String error) {
+        String sql = """
+                UPDATE knowledge_base SET index_status = 'DIRTY', last_index_error = ?
+                WHERE id = ? AND source_revision = ? AND index_status = 'BUILDING'
+                """;
+        try (Connection connection = database.connect(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, error == null ? "" : error);
+            statement.setString(2, knowledgeBaseId);
+            statement.setLong(3, revision);
+            return statement.executeUpdate() == 1;
+        } catch (SQLException failure) {
+            throw new DataAccessException("无法丢弃旧索引构建", failure);
+        }
     }
 
     public boolean markIndexDirtyIfCurrent(String knowledgeBaseId, long sourceRevision, String reason,

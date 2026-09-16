@@ -39,7 +39,8 @@ public final class CourseFeaturesTest {
         server.start();
 
         KnowledgeService service = new KnowledgeService(new FakeEmbeddingProvider(), repository, repository,
-                new SecretCodec(), new OpenAiCompatibleClient(), new FileSystemIndexRepository(work.resolve("indexes")),
+                new SecretCodec(work.resolve("secret.key")), new OpenAiCompatibleClient(),
+                new FileSystemIndexRepository(work.resolve("indexes")),
                 new ImmediateFreshnessMonitor());
         service.restore();
         check(service.currentKnowledgeBase().id().equals(first.id()), "应选择第一个知识库");

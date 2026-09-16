@@ -256,7 +256,19 @@ public final class FileExplorerUseCase implements BrowseKnowledgeFiles {
         if (owner == null) {
             throw new IllegalArgumentException("路径不在当前知识库的数据源目录内：" + target);
         }
+        rejectSymbolicLinks(owner, target);
         return owner;
+    }
+
+    /** The index scanner never follows links; direct use-case calls must obey the same boundary. */
+    private static void rejectSymbolicLinks(Path root, Path target) {
+        Path current = root;
+        for (Path part : root.relativize(target)) {
+            current = current.resolve(part);
+            if (Files.isSymbolicLink(current)) {
+                throw new IllegalArgumentException("路径包含符号链接，已拒绝访问：" + target);
+            }
+        }
     }
 
     private IndexHandle requireIdentity(String knowledgeBaseId, long revision) {
